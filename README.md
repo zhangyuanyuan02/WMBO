@@ -1,4 +1,4 @@
-# RP-WMBO
+# WMBO
 
 Initial repository for a research project on world-model reasoning for black-box optimisation.
 
