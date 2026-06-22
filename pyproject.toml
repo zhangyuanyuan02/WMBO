@@ -1,0 +1,9 @@
+[project]
+name = "rp-wmbo"
+version = "0.0.1"
+description = "Initial skeleton for a world-model black-box optimisation project"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

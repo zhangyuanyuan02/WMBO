@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+
+# Local files and outputs
+.env
+configs/llm_secrets.yaml
+results/
+models/
+outputs/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
