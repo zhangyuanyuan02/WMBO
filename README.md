@@ -2,7 +2,9 @@
 
 Initial repository for a research project on world-model reasoning for black-box optimisation.
 
-## Planned structure
+This repository is still at the code-skeleton stage. The current commit only defines the planned modules, function signatures, input variables, and output data structures. Algorithm implementations and experiments will be added later.
+
+## Structure
 
 ```text
 src/wmbo/        Python package source code
@@ -12,8 +14,8 @@ requirements.txt Project dependencies
 
 ## TODO
 
-- Define benchmark functions
+- Implement benchmark functions
 - Implement baseline optimisers
-- Implement the WMBO agent
-- Add experiment configs
-- Add tests and result analysis
+- Implement surrogate and acquisition logic
+- Implement the WMBO reasoning agent
+- Add experiment configs, tests, and result analysis
