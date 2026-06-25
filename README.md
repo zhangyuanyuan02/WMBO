@@ -1,8 +1,8 @@
-# WMBO
+# RP-WMBO
 
 Initial repository for a research project on world-model reasoning for black-box optimisation.
 
-This repository is still at an early implementation stage. The current commit adds synthetic benchmark functions and basic search-space utilities. Optimisers, agents, runners, tests, and experiments will be added later.
+This repository is still at an early implementation stage. The current commit adds a lightweight surrogate model and acquisition utilities on top of the existing synthetic benchmark functions.
 
 ## Structure
 
@@ -12,9 +12,17 @@ run_benchmark.py Command-line entry point
 requirements.txt Project dependencies
 ```
 
+## Current status
+
+Implemented so far:
+
+- Synthetic benchmark functions and search-space utilities
+- Gaussian-process surrogate wrapper
+- Acquisition scoring utilities for candidate selection
+
 ## TODO
 
 - Implement baseline optimisers
-- Implement surrogate and acquisition logic
 - Implement the WMBO reasoning agent
-- Add experiment configs, tests, and result analysis
+- Add experiment runner logic
+- Add configs, tests, and result analysis
