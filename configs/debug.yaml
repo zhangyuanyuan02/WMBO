@@ -1,0 +1,15 @@
+experiment:
+  budget: 10
+  seeds: [0]
+  methods:
+    - random
+    - bo_ei
+    - wmbo
+  initial_samples: 4
+  candidate_pool_size: 256
+  output_dir: results/debug
+
+benchmark_suite:
+  benchmarks:
+    - branin
+    - ackley5

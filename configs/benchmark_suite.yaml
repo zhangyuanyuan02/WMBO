@@ -1,0 +1,29 @@
+experiment:
+  budget: 30
+  seeds: [0, 1, 2]
+  methods:
+    - random
+    - sobol
+    - bo_ei
+    - bo_pi
+    - bo_lcb
+    - simple_es
+    - wmbo
+  initial_samples: 5
+  candidate_pool_size: 1024
+  output_dir: results/benchmark_suite
+
+optimizer:
+  options: {}
+
+benchmark_suite:
+  benchmarks:
+    - branin
+    - hartmann3
+    - hartmann6
+    - ackley5
+    - rastrigin5
+    - rosenbrock3
+    - levy5
+    - griewank5
+    - styblinski5
