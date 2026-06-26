@@ -20,9 +20,9 @@ Implemented so far:
 - Gaussian-process surrogate wrapper
 - Acquisition scoring utilities for candidate selection
 
-## TODO
+## Implemented workflow
 
-- Implement baseline optimisers
-- Implement the WMBO reasoning agent
-- Add experiment runner logic
-- Add configs, tests, and result analysis
+- Baseline random-search optimiser
+- Lightweight WMBO optimiser with heuristic reasoning, GP surrogate fitting, and acquisition-based candidate selection
+- Benchmark suite runner with JSON result persistence
+- Run summaries with best-so-far and regret curves

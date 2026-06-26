@@ -5,8 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Mapping, Sequence
 
-from .control import RunConfig
-from .metrics import RunSummary
+from .benchmarks import EvaluationRequest, evaluate, get_benchmark
+from .control import RunConfig, build_default_optimizer_config
+from .metrics import RunSummary, summarise_run
+from .optimizers import OptimizerState, make_optimizer
+from .utils import write_json
 
 
 @dataclass(frozen=True)
@@ -63,7 +66,36 @@ def run_single_benchmark(request: BenchmarkRunRequest) -> BenchmarkRunResult:
         ``BenchmarkRunResult`` with observations and summary metrics.
     """
 
-    raise NotImplementedError("Single benchmark execution is not implemented yet.")
+    benchmark = get_benchmark(request.benchmark_name)
+    config = build_default_optimizer_config(request.method, request.budget, request.seed)
+    optimizer = make_optimizer(request.method, config)
+    state = OptimizerState(benchmark=benchmark, observations=[], step=0)
+
+    for index in range(request.budget):
+        candidate = optimizer.ask(state)
+        result = evaluate(EvaluationRequest(benchmark_name=benchmark.name, x_unit=candidate, seed=request.seed + index))
+        state = optimizer.tell(state, result)
+
+    values = [obs.y for obs in state.observations]
+    summary = summarise_run(benchmark.name, request.method, request.seed, values, benchmark.optimum_value)
+    observations = [
+        {
+            "step": index,
+            "x_unit": list(obs.x),
+            "y": obs.y,
+            "metadata": dict(obs.metadata),
+        }
+        for index, obs in enumerate(state.observations)
+    ]
+    result = BenchmarkRunResult(
+        request=request,
+        summary=summary,
+        observations=observations,
+        metadata={"benchmark": benchmark.name, "dim": benchmark.dim},
+    )
+    if request.output_dir:
+        save_run_result(result, request.output_dir)
+    return result
 
 
 def run_benchmark_suite(config: RunConfig) -> list[BenchmarkRunResult]:
@@ -76,7 +108,22 @@ def run_benchmark_suite(config: RunConfig) -> list[BenchmarkRunResult]:
         List of ``BenchmarkRunResult`` objects.
     """
 
-    raise NotImplementedError("Benchmark suite execution is not implemented yet.")
+    results: list[BenchmarkRunResult] = []
+    for benchmark_name in config.benchmarks:
+        for method in config.methods:
+            for seed in config.seeds:
+                results.append(
+                    run_single_benchmark(
+                        BenchmarkRunRequest(
+                            benchmark_name=benchmark_name,
+                            method=method,
+                            seed=seed,
+                            budget=config.optimizer.budget,
+                            output_dir=config.output_dir,
+                        )
+                    )
+                )
+    return results
 
 
 def save_run_result(result: BenchmarkRunResult, output_dir: str) -> None:
@@ -90,4 +137,27 @@ def save_run_result(result: BenchmarkRunResult, output_dir: str) -> None:
         None. Future implementation will write files to disk.
     """
 
-    raise NotImplementedError("Run result persistence is not implemented yet.")
+    path = f"{output_dir}/{result.request.benchmark_name}_{result.request.method}_seed{result.request.seed}.json"
+    write_json(
+        path,
+        {
+            "request": {
+                "benchmark_name": result.request.benchmark_name,
+                "method": result.request.method,
+                "seed": result.request.seed,
+                "budget": result.request.budget,
+                "metadata": dict(result.request.metadata),
+            },
+            "summary": {
+                "benchmark_name": result.summary.benchmark_name,
+                "method": result.summary.method,
+                "seed": result.summary.seed,
+                "final_best": result.summary.final_best,
+                "final_regret": result.summary.final_regret,
+                "num_evaluations": result.summary.num_evaluations,
+                "metadata": dict(result.summary.metadata),
+            },
+            "observations": list(result.observations),
+            "metadata": dict(result.metadata),
+        },
+    )

@@ -84,7 +84,15 @@ def build_default_optimizer_config(method: str, budget: int, seed: int) -> Optim
         ``OptimizerConfig`` with project defaults.
     """
 
-    raise NotImplementedError("Default optimiser config is not implemented yet.")
+    if budget <= 0:
+        raise ValueError("budget must be positive.")
+    return OptimizerConfig(
+        method=method,
+        budget=int(budget),
+        initial_samples=min(max(2, budget // 5), budget),
+        candidate_pool_size=256,
+        seed=int(seed),
+    )
 
 
 def should_stop(state: RunState) -> bool:
@@ -97,7 +105,7 @@ def should_stop(state: RunState) -> bool:
         ``True`` when no more evaluations should be performed.
     """
 
-    raise NotImplementedError("Stopping logic is not implemented yet.")
+    return state.evaluations_remaining <= 0
 
 
 def update_run_state(state: RunState, new_y: float) -> RunState:
@@ -111,4 +119,11 @@ def update_run_state(state: RunState, new_y: float) -> RunState:
         Updated ``RunState``.
     """
 
-    raise NotImplementedError("Run state updates are not implemented yet.")
+    best_y = float(new_y) if state.best_y is None else min(float(state.best_y), float(new_y))
+    used = state.evaluations_used + 1
+    return RunState(
+        step=state.step + 1,
+        best_y=best_y,
+        evaluations_used=used,
+        evaluations_remaining=max(0, state.evaluations_remaining - 1),
+    )

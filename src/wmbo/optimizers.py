@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import random
 from typing import Mapping, Protocol, Sequence
 
-from .benchmarks import BenchmarkSpec, EvaluationResult
+from .acquisition import AcquisitionInput, select_next_candidate
+from .agents import AgentState, CandidateValidator, WorldModelAgent
+from .benchmarks import BenchmarkSpec, EvaluationResult, sample_unit_points
 from .control import OptimizerConfig
+from .descriptors import describe_landscape
+from .surrogate import SurrogateDataset, make_surrogate
 
 Vector = Sequence[float]
 Matrix = Sequence[Vector]
@@ -104,7 +109,8 @@ class RandomSearchOptimizer:
             Candidate point in normalised coordinates.
         """
 
-        raise NotImplementedError("Random-search candidate generation is not implemented yet.")
+        rng = random.Random(self.config.seed + state.step)
+        return [rng.random() for _ in range(state.benchmark.dim)]
 
     def tell(self, state: OptimizerState, result: EvaluationResult) -> OptimizerState:
         """Update random-search state after an evaluation.
@@ -117,7 +123,14 @@ class RandomSearchOptimizer:
             Updated optimiser state.
         """
 
-        raise NotImplementedError("Random-search state update is not implemented yet.")
+        observations = list(state.observations)
+        observations.append(Observation(x=list(result.x_unit), y=float(result.y), metadata=result.metadata))
+        return OptimizerState(
+            benchmark=state.benchmark,
+            observations=observations,
+            step=state.step + 1,
+            metadata=state.metadata,
+        )
 
 
 class WMBOOptimizer:
@@ -134,6 +147,7 @@ class WMBOOptimizer:
         """
 
         self.config = config
+        self.agent = WorldModelAgent()
 
     def ask(self, state: OptimizerState) -> Vector:
         """Propose a candidate using world-model reasoning.
@@ -145,7 +159,55 @@ class WMBOOptimizer:
             Candidate point in normalised coordinates.
         """
 
-        raise NotImplementedError("WMBO candidate generation is not implemented yet.")
+        if len(state.observations) < self.config.initial_samples:
+            return RandomSearchOptimizer(self.config).ask(state)
+
+        observed_x = [obs.x for obs in state.observations]
+        observed_y = [obs.y for obs in state.observations]
+        candidates = sample_unit_points(
+            max(1, self.config.candidate_pool_size),
+            state.benchmark.dim,
+            seed=self.config.seed + 10_000 + state.step,
+        )
+        surrogate = make_surrogate(
+            "gaussian_process",
+            dim=state.benchmark.dim,
+            options={"seed": self.config.seed, **dict(self.config.options)},
+        ).fit(SurrogateDataset(x=observed_x, y=observed_y))
+        prediction = surrogate.predict(candidates)
+        descriptor = describe_landscape(
+            observed_x,
+            observed_y,
+            surrogate_metadata={**dict(prediction.metadata), "std": prediction.std},
+        )
+        decision = self.agent.decide(
+            AgentState(
+                observed_x=observed_x,
+                observed_y=observed_y,
+                descriptor={
+                    "dim": descriptor.dim,
+                    "best_y": descriptor.best_y,
+                    "y_range": descriptor.y_range,
+                    "smoothness": descriptor.smoothness,
+                    "modality": descriptor.modality,
+                    "uncertainty": descriptor.uncertainty,
+                    "labels": dict(descriptor.labels),
+                },
+                budget_used=len(state.observations),
+                budget_total=self.config.budget,
+            )
+        )
+        selected = select_next_candidate(
+            AcquisitionInput(
+                candidates=candidates,
+                observed_x=observed_x,
+                observed_y=observed_y,
+                surrogate_mean=prediction.mean,
+                surrogate_std=prediction.std,
+                strategy=decision.strategy,
+            )
+        )
+        return CandidateValidator(state.benchmark.dim).repair(selected.selected_x)
 
     def tell(self, state: OptimizerState, result: EvaluationResult) -> OptimizerState:
         """Update WMBO state after an evaluation.
@@ -158,7 +220,7 @@ class WMBOOptimizer:
             Updated optimiser state.
         """
 
-        raise NotImplementedError("WMBO state update is not implemented yet.")
+        return RandomSearchOptimizer(self.config).tell(state, result)
 
 
 def make_optimizer(method: str, config: OptimizerConfig) -> Optimizer:
@@ -172,4 +234,9 @@ def make_optimizer(method: str, config: OptimizerConfig) -> Optimizer:
         Object implementing the ``Optimizer`` protocol.
     """
 
-    raise NotImplementedError("Optimiser factory is not implemented yet.")
+    key = method.strip().lower().replace("-", "_")
+    if key in {"random", "random_search", "baseline"}:
+        return RandomSearchOptimizer(config)
+    if key in {"wmbo", "world_model", "world_model_bo"}:
+        return WMBOOptimizer(config)
+    raise ValueError(f"Unknown optimiser method: {method}")

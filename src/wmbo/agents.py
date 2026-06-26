@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Mapping, Sequence
 
 Vector = Sequence[float]
@@ -82,7 +83,21 @@ class CandidateValidator:
             Tuple ``(is_valid, issues)``.
         """
 
-        raise NotImplementedError("Candidate validation is not implemented yet.")
+        issues: list[str] = []
+        if len(candidate) != self.dim:
+            issues.append(f"Expected {self.dim} dimensions, got {len(candidate)}.")
+            return False, issues
+        for index, value in enumerate(candidate):
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                issues.append(f"Coordinate {index} is not numeric.")
+                continue
+            if not math.isfinite(numeric):
+                issues.append(f"Coordinate {index} is not finite.")
+            elif numeric < self.lower or numeric > self.upper:
+                issues.append(f"Coordinate {index} is outside [{self.lower}, {self.upper}].")
+        return not issues, issues
 
     def repair(self, candidate: Vector) -> list[float]:
         """Repair an invalid candidate into the allowed search domain.
@@ -94,7 +109,10 @@ class CandidateValidator:
             Repaired candidate as a list of floats.
         """
 
-        raise NotImplementedError("Candidate repair is not implemented yet.")
+        repaired = [float(value) for value in candidate[: self.dim]]
+        if len(repaired) < self.dim:
+            repaired.extend([self.lower] * (self.dim - len(repaired)))
+        return [min(self.upper, max(self.lower, value if math.isfinite(value) else self.lower)) for value in repaired]
 
 
 class WorldModelAgent:
@@ -110,4 +128,29 @@ class WorldModelAgent:
             A ``ReasoningDecision`` describing the selected strategy.
         """
 
-        raise NotImplementedError("World-model reasoning is not implemented yet.")
+        descriptor = dict(state.descriptor)
+        remaining = max(0, state.budget_total - state.budget_used)
+        uncertainty = descriptor.get("uncertainty")
+        modality = descriptor.get("modality")
+        progress = state.budget_used / state.budget_total if state.budget_total else 1.0
+
+        if state.budget_used < max(2, len(state.observed_x[0]) + 1 if state.observed_x else 2):
+            strategy = "global_diverse"
+            rationale = "Collecting an initial space-filling design."
+        elif isinstance(uncertainty, (int, float)) and uncertainty > 0.35 and progress < 0.75:
+            strategy = "explore_ucb"
+            rationale = "Surrogate uncertainty is still high."
+        elif isinstance(modality, (int, float)) and modality > 0.6 and remaining > 2:
+            strategy = "global_diverse"
+            rationale = "Observed values suggest a rugged or multimodal landscape."
+        else:
+            strategy = "expected_improvement"
+            rationale = "Balancing predicted improvement and model uncertainty."
+
+        return ReasoningDecision(
+            strategy=strategy,
+            hypothesis=f"Best observed value is {min(state.observed_y) if state.observed_y else None}.",
+            confidence=min(1.0, 0.4 + 0.6 * progress),
+            rationale=rationale,
+            metadata={"remaining_budget": remaining},
+        )
