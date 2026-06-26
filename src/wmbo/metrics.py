@@ -1,4 +1,4 @@
-"""Metric interfaces for optimisation runs."""
+"""Metric utilities for optimisation runs."""
 
 from __future__ import annotations
 
@@ -43,7 +43,18 @@ def cumulative_best(values: Sequence[float], minimise: bool = True) -> list[floa
         Best-so-far curve.
     """
 
-    raise NotImplementedError("Cumulative-best metric is not implemented yet.")
+    best_values: list[float] = []
+    best: float | None = None
+    for value in values:
+        current = float(value)
+        if best is None:
+            best = current
+        elif minimise:
+            best = min(best, current)
+        else:
+            best = max(best, current)
+        best_values.append(float(best))
+    return best_values
 
 
 def simple_regret(best_values: Sequence[float], optimum_value: float | None) -> list[float | None]:
@@ -57,7 +68,10 @@ def simple_regret(best_values: Sequence[float], optimum_value: float | None) -> 
         Simple-regret curve. Values are ``None`` when optimum is unknown.
     """
 
-    raise NotImplementedError("Simple regret metric is not implemented yet.")
+    if optimum_value is None:
+        return [None for _ in best_values]
+    optimum = float(optimum_value)
+    return [max(0.0, float(best) - optimum) for best in best_values]
 
 
 def summarise_run(
@@ -80,4 +94,30 @@ def summarise_run(
         ``RunSummary`` containing final best value and regret.
     """
 
-    raise NotImplementedError("Run summary metric is not implemented yet.")
+    objective_values = [float(value) for value in values]
+    best_curve = cumulative_best(objective_values, minimise=True)
+    regret_curve = simple_regret(best_curve, optimum_value)
+    final_best = best_curve[-1] if best_curve else None
+    final_regret = regret_curve[-1] if regret_curve else None
+    return RunSummary(
+        benchmark_name=benchmark_name,
+        method=method,
+        seed=int(seed),
+        final_best=final_best,
+        final_regret=final_regret,
+        num_evaluations=len(objective_values),
+        metadata={
+            "best_curve": best_curve,
+            "regret_curve": regret_curve,
+            "first_value": objective_values[0] if objective_values else None,
+            "last_value": objective_values[-1] if objective_values else None,
+        },
+    )
+
+
+__all__ = [
+    "RunSummary",
+    "cumulative_best",
+    "simple_regret",
+    "summarise_run",
+]
