@@ -89,9 +89,10 @@ def build_default_optimizer_config(method: str, budget: int, seed: int) -> Optim
     return OptimizerConfig(
         method=method,
         budget=int(budget),
-        initial_samples=min(max(2, budget // 5), budget),
+        initial_samples=min(5, int(budget)),
         candidate_pool_size=256,
         seed=int(seed),
+        options={},
     )
 
 
@@ -121,9 +122,5 @@ def update_run_state(state: RunState, new_y: float) -> RunState:
 
     best_y = float(new_y) if state.best_y is None else min(float(state.best_y), float(new_y))
     used = state.evaluations_used + 1
-    return RunState(
-        step=state.step + 1,
-        best_y=best_y,
-        evaluations_used=used,
-        evaluations_remaining=max(0, state.evaluations_remaining - 1),
-    )
+    remaining = max(0, state.evaluations_remaining - 1)
+    return RunState(step=state.step + 1, best_y=best_y, evaluations_used=used, evaluations_remaining=remaining)

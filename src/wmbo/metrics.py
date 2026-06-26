@@ -43,18 +43,7 @@ def cumulative_best(values: Sequence[float], minimise: bool = True) -> list[floa
         Best-so-far curve.
     """
 
-    best_values: list[float] = []
-    best: float | None = None
-    for value in values:
-        current = float(value)
-        if best is None:
-            best = current
-        elif minimise:
-            best = min(best, current)
-        else:
-            best = max(best, current)
-        best_values.append(best)
-    return best_values
+    raise NotImplementedError("Cumulative-best metric is not implemented yet.")
 
 
 def simple_regret(best_values: Sequence[float], optimum_value: float | None) -> list[float | None]:
@@ -68,10 +57,7 @@ def simple_regret(best_values: Sequence[float], optimum_value: float | None) -> 
         Simple-regret curve. Values are ``None`` when optimum is unknown.
     """
 
-    if optimum_value is None:
-        return [None for _ in best_values]
-    optimum = float(optimum_value)
-    return [float(best) - optimum for best in best_values]
+    raise NotImplementedError("Simple regret metric is not implemented yet.")
 
 
 def summarise_run(
@@ -94,17 +80,4 @@ def summarise_run(
         ``RunSummary`` containing final best value and regret.
     """
 
-    best_values = cumulative_best(values, minimise=True)
-    regrets = simple_regret(best_values, optimum_value)
-    return RunSummary(
-        benchmark_name=benchmark_name,
-        method=method,
-        seed=seed,
-        final_best=best_values[-1] if best_values else None,
-        final_regret=regrets[-1] if regrets else None,
-        num_evaluations=len(values),
-        metadata={
-            "cumulative_best": best_values,
-            "simple_regret": regrets,
-        },
-    )
+    raise NotImplementedError("Run summary metric is not implemented yet.")

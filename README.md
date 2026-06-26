@@ -2,7 +2,7 @@
 
 Initial repository for a research project on world-model reasoning for black-box optimisation.
 
-This repository is still at an early implementation stage. The current commit adds a lightweight surrogate model and acquisition utilities on top of the existing synthetic benchmark functions.
+This repository is still at an early implementation stage. The current commit adds a deterministic rule-based WMBO reasoning agent on top of the existing benchmark, surrogate, acquisition, and baseline optimiser utilities.
 
 ## Structure
 
@@ -19,10 +19,12 @@ Implemented so far:
 - Synthetic benchmark functions and search-space utilities
 - Gaussian-process surrogate wrapper
 - Acquisition scoring utilities for candidate selection
+- Baseline optimisers: random search, Sobol search, BO-EI/PI/LCB, and a simple evolutionary strategy
+- Rule-based WMBO landscape descriptor and reasoning agent
+- WMBO candidate generation through `ask -> evaluate -> tell`
 
-## Implemented workflow
+## TODO
 
-- Baseline random-search optimiser
-- Lightweight WMBO optimiser with heuristic reasoning, GP surrogate fitting, and acquisition-based candidate selection
-- Benchmark suite runner with JSON result persistence
-- Run summaries with best-so-far and regret curves
+- Add experiment runner logic
+- Add configs, tests, and result analysis
+- Add optional LLM-backed reasoning after the rule-based agent is stable
