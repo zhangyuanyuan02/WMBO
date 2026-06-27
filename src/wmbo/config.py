@@ -60,7 +60,12 @@ def run_config_from_mapping(data: Mapping[str, Any]) -> RunConfig:
         name="candidate_pool_size",
     )
     output_dir = str(experiment.get("output_dir", data.get("output_dir", "results")))
-    options = _mapping(optimizer_section.get("options", {}), section="optimizer.options")
+    options = dict(_mapping(optimizer_section.get("options", {}), section="optimizer.options"))
+    control_options = optimizer_section.get("wmbo_control", data.get("wmbo_control", {}))
+    if control_options is not None:
+        control_mapping = _mapping(control_options, section="optimizer.wmbo_control")
+        if control_mapping:
+            options["wmbo_control"] = dict(control_mapping)
 
     optimizer = OptimizerConfig(
         method=methods[0],

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import math
 import random
-from typing import Mapping, Protocol, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 
 import numpy as np
 from scipy.stats import qmc
@@ -13,7 +13,7 @@ from scipy.stats import qmc
 from .acquisition import AcquisitionInput, select_next_candidate
 from .agents import AgentState, CandidateValidator, WorldModelAgent
 from .benchmarks import BenchmarkSpec, EvaluationResult, sample_unit_points
-from .control import OptimizerConfig
+from .control import STRATEGIES, OptimizerConfig, WMBOControlConfig, WMBOState
 from .descriptors import describe_landscape
 from .surrogate import SurrogateDataset, make_surrogate
 
@@ -314,8 +314,10 @@ class WMBOOptimizer:
         self.config = config
         self._initial = SobolSearchOptimizer(config)
         self._agent = WorldModelAgent()
+        self._control = WMBOState(_wmbo_control_config_from_options(self.config.options))
         self._last_decision: Mapping[str, object] | None = None
         self._last_acquisition: Mapping[str, object] | None = None
+        self._pending_trial: Mapping[str, object] | None = None
 
     def ask(self, state: OptimizerState) -> Vector:
         """Propose a candidate using rule-based world-model reasoning.
@@ -330,9 +332,15 @@ class WMBOOptimizer:
         _validate_state(state)
         if len(state.observations) < max(1, self.config.initial_samples):
             candidate = self._initial.ask(state)
+            phase = self._control.budget_phase(state.step, self.config.budget)
+            self._pending_trial = None
             self._last_decision = {
                 "strategy": "initial_design",
+                "executed_strategy": "initial_design",
                 "rationale": "Collecting initial Sobol design points before fitting a world model.",
+                "budget_phase": phase,
+                "remaining_budget": self._control.remaining_budget(state.step, self.config.budget),
+                "wmbo_control": self._control.to_dict(),
             }
             self._last_acquisition = {"strategy": "sobol"}
             return candidate
@@ -362,6 +370,7 @@ class WMBOOptimizer:
                 "mean_std": float(np.mean(descriptor_prediction.std)) if descriptor_prediction.std else 1.0,
             },
         )
+        phase = self._control.budget_phase(state.step, self.config.budget)
         decision = self._agent.decide(
             AgentState(
                 observed_x=observed_x.tolist(),
@@ -371,9 +380,24 @@ class WMBOOptimizer:
                 budget_total=self.config.budget,
             )
         )
+        labels = dict(descriptor.labels)
+        executed_strategy, override_reason, allowed_strategies = self._control.choose_strategy(
+            proposed_strategy=decision.strategy,
+            phase=phase,
+            trial_number=state.step + 1,
+            uncertainty=float(descriptor.uncertainty if descriptor.uncertainty is not None else 1.0),
+            smoothness_label=labels.get("smoothness", "unknown"),
+            modality_label=labels.get("modality", "unknown"),
+        )
+        hypothesis_record = self._control.create_hypothesis(
+            text=decision.hypothesis,
+            strategy=executed_strategy,
+            trial_number=state.step + 1,
+            baseline_best=float(np.min(observed_y)),
+        )
 
         candidate_pool = _make_wmbo_candidate_pool(
-            strategy=decision.strategy,
+            strategy=executed_strategy,
             observed_x=observed_x,
             observed_y=observed_y,
             dim=state.benchmark.dim,
@@ -381,7 +405,7 @@ class WMBOOptimizer:
             seed=self.config.seed + 30_000 + state.step,
         )
         prediction = surrogate.predict(candidate_pool)
-        acquisition_strategy = _strategy_to_acquisition(decision.strategy)
+        acquisition_strategy = _strategy_to_acquisition(executed_strategy)
         acquisition = select_next_candidate(
             AcquisitionInput(
                 candidates=candidate_pool,
@@ -398,11 +422,32 @@ class WMBOOptimizer:
         if not is_valid:
             candidate = validator.repair(candidate)
 
-        self._last_decision = decision.to_dict()
+        self._pending_trial = {
+            "strategy": executed_strategy,
+            "trial_number": state.step + 1,
+            "hypothesis_id": hypothesis_record.hypothesis_id if hypothesis_record else None,
+        }
+        self._last_decision = {
+            **decision.to_dict(),
+            "proposed_strategy": decision.strategy,
+            "executed_strategy": executed_strategy,
+            "override_reason": override_reason,
+            "allowed_strategies": sorted(allowed_strategies),
+            "budget_phase": phase,
+            "remaining_budget": self._control.remaining_budget(state.step, self.config.budget),
+            "strategy_trust": dict(self._control.trusts),
+            "strategy_success_rates": self._control.recent_success_rates(),
+            "hypothesis_id": hypothesis_record.hypothesis_id if hypothesis_record else None,
+            "hypothesis_status": hypothesis_record.status if hypothesis_record else None,
+            "hypothesis_status_counts": self._control.hypothesis_status_counts(),
+            "wmbo_control": self._control.to_dict(),
+        }
         self._last_acquisition = {
             **dict(acquisition.metadata),
             "score": acquisition.score,
             "selected_index": acquisition.selected_index,
+            "strategy": executed_strategy,
+            "acquisition_strategy": acquisition_strategy,
             "descriptor": descriptor.to_dict(),
         }
         return candidate
@@ -418,12 +463,43 @@ class WMBOOptimizer:
             Updated optimiser state.
         """
 
+        previous_best = min((float(observation.y) for observation in state.observations), default=None)
         updated = append_observation(state, result)
         metadata = dict(updated.metadata)
+
+        outcome_metadata: dict[str, object] | None = None
+        if self._pending_trial is not None and previous_best is not None:
+            tolerance = max(1e-8, 0.001 * max(abs(previous_best), 1.0))
+            improved = bool(float(result.y) < previous_best - tolerance)
+            best_y = min(previous_best, float(result.y))
+            outcome = self._control.record_outcome(
+                strategy=str(self._pending_trial.get("strategy", "exploit_ei")),
+                trial_number=int(self._pending_trial.get("trial_number", updated.step)),
+                improved=improved,
+                y=float(result.y),
+                best_y=best_y,
+            )
+            outcome_metadata = outcome.to_dict()
+
         if self._last_decision is not None:
-            metadata["last_reasoning_decision"] = dict(self._last_decision)
+            decision_metadata = dict(self._last_decision)
+            if outcome_metadata is not None:
+                decision_metadata["last_outcome"] = outcome_metadata
+                hypothesis_id = decision_metadata.get("hypothesis_id")
+                if hypothesis_id:
+                    record = next(
+                        (record for record in self._control.hypotheses if record.hypothesis_id == hypothesis_id),
+                        None,
+                    )
+                    decision_metadata["hypothesis_status"] = record.status if record else None
+            decision_metadata["strategy_trust"] = dict(self._control.trusts)
+            decision_metadata["strategy_success_rates"] = self._control.recent_success_rates()
+            decision_metadata["hypothesis_status_counts"] = self._control.hypothesis_status_counts()
+            decision_metadata["wmbo_control"] = self._control.to_dict()
+            metadata["last_reasoning_decision"] = decision_metadata
         if self._last_acquisition is not None:
             metadata["last_acquisition"] = dict(self._last_acquisition)
+        metadata["wmbo_control"] = self._control.to_dict()
         return OptimizerState(
             benchmark=updated.benchmark,
             observations=updated.observations,
@@ -557,6 +633,18 @@ def _validate_state(state: OptimizerState) -> None:
         if not math.isfinite(float(observation.y)):
             raise ValueError("Observation outputs must be finite.")
 
+
+
+def _wmbo_control_config_from_options(options: Mapping[str, object]) -> WMBOControlConfig:
+    raw_control = options.get("wmbo_control", options.get("control", {})) if isinstance(options, Mapping) else {}
+    if not isinstance(raw_control, Mapping):
+        raw_control = {}
+    fields = WMBOControlConfig.__dataclass_fields__
+    values: dict[str, Any] = {}
+    for key in fields:
+        if key in raw_control:
+            values[key] = raw_control[key]
+    return WMBOControlConfig(**values)
 
 def _strategy_to_acquisition(strategy: str) -> str:
     key = strategy.strip().lower().replace("-", "_")

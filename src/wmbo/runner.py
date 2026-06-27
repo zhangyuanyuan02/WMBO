@@ -92,6 +92,7 @@ def run_single_benchmark(request: BenchmarkRunRequest) -> BenchmarkRunResult:
         objective_values.append(float(result.y))
         best_curve = cumulative_best(objective_values, minimise=True)
         regret_curve = simple_regret(best_curve, benchmark.optimum_value)
+        optimiser_metadata = _extract_observation_metadata(state.metadata)
         observations.append(
             {
                 "step": step,
@@ -103,6 +104,7 @@ def run_single_benchmark(request: BenchmarkRunRequest) -> BenchmarkRunResult:
                 "y": float(result.y),
                 "best_y": best_curve[-1],
                 "simple_regret": regret_curve[-1],
+                **optimiser_metadata,
             }
         )
 
@@ -237,7 +239,29 @@ def _summary_to_dict(summary: RunSummary) -> dict[str, object]:
 
 def _write_observations_csv(path: Path, observations: Sequence[Mapping[str, object]]) -> None:
     ensure_dir(path.parent)
-    fieldnames = ["step", "benchmark", "method", "seed", "x_unit", "x_raw", "y", "best_y", "simple_regret"]
+    fieldnames = [
+        "step",
+        "benchmark",
+        "method",
+        "seed",
+        "x_unit",
+        "x_raw",
+        "y",
+        "best_y",
+        "simple_regret",
+        "strategy",
+        "proposed_strategy",
+        "executed_strategy",
+        "override_reason",
+        "budget_phase",
+        "remaining_budget",
+        "consecutive_no_improvement",
+        "hypothesis_id",
+        "hypothesis_status",
+        "hypothesis_status_counts",
+        "strategy_trust",
+        "strategy_success_rates",
+    ]
     with path.open("w", encoding="utf-8", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=fieldnames)
         writer.writeheader()
@@ -245,6 +269,8 @@ def _write_observations_csv(path: Path, observations: Sequence[Mapping[str, obje
             row = dict(observation)
             row["x_unit"] = _format_vector(row.get("x_unit"))
             row["x_raw"] = _format_vector(row.get("x_raw"))
+            for key in ("strategy_trust", "strategy_success_rates", "hypothesis_status_counts"):
+                row[key] = _format_mapping(row.get(key))
             writer.writerow({name: row.get(name) for name in fieldnames})
 
 
@@ -258,11 +284,40 @@ def _write_summary_csv(path: Path, rows: Sequence[Mapping[str, object]]) -> None
             writer.writerow({name: row.get(name) for name in fieldnames})
 
 
+
+def _extract_observation_metadata(state_metadata: Mapping[str, object]) -> dict[str, object]:
+    decision = state_metadata.get("last_reasoning_decision") if isinstance(state_metadata, Mapping) else None
+    if not isinstance(decision, Mapping):
+        return {}
+    control = decision.get("wmbo_control")
+    control_map = control if isinstance(control, Mapping) else {}
+    return {
+        "strategy": decision.get("executed_strategy", decision.get("strategy")),
+        "proposed_strategy": decision.get("proposed_strategy"),
+        "executed_strategy": decision.get("executed_strategy"),
+        "override_reason": decision.get("override_reason"),
+        "budget_phase": decision.get("budget_phase"),
+        "remaining_budget": decision.get("remaining_budget"),
+        "consecutive_no_improvement": control_map.get("consecutive_no_improvement"),
+        "hypothesis_id": decision.get("hypothesis_id"),
+        "hypothesis_status": decision.get("hypothesis_status"),
+        "hypothesis_status_counts": decision.get("hypothesis_status_counts"),
+        "strategy_trust": decision.get("strategy_trust"),
+        "strategy_success_rates": decision.get("strategy_success_rates"),
+    }
+
 def _format_vector(value: object) -> str:
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
         return "[" + ", ".join(f"{float(item):.8g}" for item in value) + "]"
     return str(value)
 
+
+
+def _format_mapping(value: object) -> str:
+    if isinstance(value, Mapping):
+        parts = [f"{key}={value[key]}" for key in sorted(value)]
+        return ";".join(parts)
+    return "" if value is None else str(value)
 
 def _to_jsonable(value: Any) -> Any:
     if is_dataclass(value):
