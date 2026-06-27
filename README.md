@@ -2,7 +2,7 @@
 
 Initial repository for a research project on world-model reasoning for black-box optimisation.
 
-This repository is still at an early implementation stage. The current commit adds YAML experiment configs so benchmark runs can be reproduced from checked-in settings.
+This repository is still at an early implementation stage. The current commit adds plotting utilities for saved benchmark outputs.
 
 ## Structure
 
@@ -25,6 +25,7 @@ Implemented so far:
 - WMBO candidate generation through `ask -> evaluate -> tell`
 - Minimal benchmark runner with JSON/CSV output
 - YAML configuration files for reproducible runs
+- Plotting utilities for saved runner outputs
 
 ## Examples
 
@@ -46,10 +47,19 @@ Command-line values can override config values:
 python run_benchmark.py --config configs/debug.yaml --budget 5 --output-dir results/quick_check
 ```
 
-Outputs are written under the configured output directory.
+Generate figures from saved results:
+
+```bash
+python - <<'PY'
+from wmbo.plotting import plot_results_directory
+
+plot_results_directory("results/debug")
+PY
+```
+
+This writes figures under `results/debug/figures/`.
 
 ## TODO
 
 - Add tests and result analysis
-- Add plotting utilities for saved outputs
 - Add optional LLM-backed reasoning after the rule-based agent is stable

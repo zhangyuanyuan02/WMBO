@@ -8,6 +8,7 @@ dependencies = [
   "scipy>=1.10",
   "scikit-learn>=1.2",
   "PyYAML>=6.0",
+  "matplotlib>=3.7",
 ]
 
 [tool.pytest.ini_options]
