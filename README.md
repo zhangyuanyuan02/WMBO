@@ -2,7 +2,7 @@
 
 Initial repository for a research project on world-model reasoning for black-box optimisation.
 
-This repository is still at an early implementation stage. The current commit adds a WMBO control state for budget-aware strategy gating, trust updates, cooldowns, and hypothesis tracking.
+This repository is still at an early implementation stage. The current commit adds an optional OpenAI-compatible LLM backend for WMBO decisions while keeping the rule-based controller as the default fallback.
 
 ## Structure
 
@@ -29,6 +29,12 @@ Implemented so far:
   - exploration cooldowns
   - strategy gating and fallback
   - hypothesis tracking
+- Optional OpenAI-compatible LLM decision backend with:
+  - chat-completions HTTP client
+  - structured world-model prompt construction
+  - JSON response parsing and validation
+  - retry/timeout handling
+  - fallback to the rule-based agent
 - Minimal benchmark runner with JSON/CSV output
 - YAML configuration files for reproducible runs
 - Plotting utilities for saved runner outputs
@@ -79,9 +85,39 @@ optimizer:
     hypothesis_window: 3
 ```
 
-These options only affect the rule-based WMBO controller at this stage. No external LLM backend is used yet.
+The control state is still applied after an LLM decision, so the LLM proposes a strategy but does not directly control the optimiser.
+
+## Optional LLM backend
+
+The default WMBO method remains rule based. To use a remote OpenAI-compatible backend, pass CLI options and keep secrets in environment variables:
+
+```bash
+export OPENAI_API_KEY=...
+python run_benchmark.py \
+  --benchmarks branin \
+  --methods wmbo \
+  --budget 10 \
+  --use-llm-agent \
+  --llm-model gpt-4o-mini
+```
+
+For compatible providers, set a base URL or API-key environment variable explicitly:
+
+```bash
+export SILICONFLOW_API_KEY=...
+python run_benchmark.py \
+  --benchmarks branin \
+  --methods wmbo \
+  --budget 10 \
+  --use-llm-agent \
+  --llm-base-url https://api.siliconflow.cn/v1 \
+  --llm-api-key-env SILICONFLOW_API_KEY \
+  --llm-model Qwen/Qwen2.5-72B-Instruct
+```
+
+LLM configuration files are intentionally not added in this commit. They are the next step after the API client is in place.
 
 ## TODO
 
+- Add LLM experiment config templates
 - Add tests and result analysis
-- Add optional LLM-backed reasoning after the control state is stable

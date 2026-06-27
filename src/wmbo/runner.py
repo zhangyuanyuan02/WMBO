@@ -261,6 +261,10 @@ def _write_observations_csv(path: Path, observations: Sequence[Mapping[str, obje
         "hypothesis_status_counts",
         "strategy_trust",
         "strategy_success_rates",
+        "agent_type",
+        "llm_error",
+        "selected_candidate_id",
+        "candidate_override",
     ]
     with path.open("w", encoding="utf-8", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=fieldnames)
@@ -304,6 +308,10 @@ def _extract_observation_metadata(state_metadata: Mapping[str, object]) -> dict[
         "hypothesis_status_counts": decision.get("hypothesis_status_counts"),
         "strategy_trust": decision.get("strategy_trust"),
         "strategy_success_rates": decision.get("strategy_success_rates"),
+        "agent_type": decision.get("agent_type"),
+        "llm_error": decision.get("llm_error"),
+        "selected_candidate_id": decision.get("selected_candidate_id"),
+        "candidate_override": decision.get("candidate_override"),
     }
 
 def _format_vector(value: object) -> str:

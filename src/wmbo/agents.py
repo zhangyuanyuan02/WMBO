@@ -52,6 +52,8 @@ class ReasoningDecision:
     hypothesis: str
     confidence: float
     rationale: str
+    world_model: Mapping[str, str] = field(default_factory=dict)
+    selected_candidate_id: str | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
@@ -62,6 +64,8 @@ class ReasoningDecision:
             "hypothesis": self.hypothesis,
             "confidence": self.confidence,
             "rationale": self.rationale,
+            "world_model": dict(self.world_model),
+            "selected_candidate_id": self.selected_candidate_id,
             "metadata": dict(self.metadata),
         }
 
@@ -195,17 +199,26 @@ class WorldModelAgent:
             hypothesis = "The current observations are sufficient for local refinement around the best point."
             rationale = "No strong signal requires broad exploration, so a local candidate pool is appropriate."
 
+        world_model = {
+            "smoothness": str(labels.get("smoothness", "unknown")),
+            "modality": str(labels.get("modality", "unknown")),
+            "curvature": str(labels.get("curvature", "unknown")),
+            "anisotropy": str(labels.get("anisotropy", "unknown")),
+        }
+
         return ReasoningDecision(
             strategy=strategy,
             hypothesis=hypothesis,
             confidence=float(np.clip(confidence, 0.0, 1.0)),
             rationale=rationale,
+            world_model=world_model,
             metadata={
                 "labels": labels,
                 "budget_used": state.budget_used,
                 "budget_total": state.budget_total,
                 "remaining_ratio": remaining_ratio,
                 "recent_improvement": recent_improvement,
+                "source": "rule",
             },
         )
 

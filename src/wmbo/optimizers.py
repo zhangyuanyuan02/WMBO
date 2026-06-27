@@ -14,8 +14,9 @@ from .acquisition import AcquisitionInput, select_next_candidate
 from .agents import AgentState, CandidateValidator, WorldModelAgent
 from .benchmarks import BenchmarkSpec, EvaluationResult, sample_unit_points
 from .control import STRATEGIES, OptimizerConfig, WMBOControlConfig, WMBOState
-from .descriptors import describe_landscape
+from .descriptors import LandscapeDescriptor, describe_landscape
 from .surrogate import SurrogateDataset, make_surrogate
+from .llm_api import LLMAPIError, OpenAIStyleClient, decide_with_llm
 
 Vector = Sequence[float]
 Matrix = Sequence[Vector]
@@ -315,6 +316,7 @@ class WMBOOptimizer:
         self._initial = SobolSearchOptimizer(config)
         self._agent = WorldModelAgent()
         self._control = WMBOState(_wmbo_control_config_from_options(self.config.options))
+        self._llm_client: OpenAIStyleClient | None = None
         self._last_decision: Mapping[str, object] | None = None
         self._last_acquisition: Mapping[str, object] | None = None
         self._pending_trial: Mapping[str, object] | None = None
@@ -371,14 +373,23 @@ class WMBOOptimizer:
             },
         )
         phase = self._control.budget_phase(state.step, self.config.budget)
-        decision = self._agent.decide(
-            AgentState(
-                observed_x=observed_x.tolist(),
-                observed_y=observed_y.tolist(),
-                descriptor=descriptor.to_dict(),
-                budget_used=state.step,
-                budget_total=self.config.budget,
-            )
+        candidate_options = _build_candidate_options(
+            candidate_pool=None,
+            prediction_mean=None,
+            prediction_std=None,
+            observed_x=observed_x,
+            observed_y=observed_y,
+            dim=state.benchmark.dim,
+            seed=self.config.seed + 25_000 + state.step,
+            n_points=max(8, min(self.config.candidate_pool_size, 64)),
+        )
+        decision, agent_type, llm_error = self._decide(
+            state=state,
+            descriptor=descriptor,
+            observed_x=observed_x,
+            observed_y=observed_y,
+            candidate_options=candidate_options,
+            phase=phase,
         )
         labels = dict(descriptor.labels)
         executed_strategy, override_reason, allowed_strategies = self._control.choose_strategy(
@@ -416,11 +427,25 @@ class WMBOOptimizer:
                 strategy=acquisition_strategy,
             )
         )
+        selected_by_llm = _candidate_from_id(decision.selected_candidate_id, candidate_options)
+        candidate_override: str | None = None
+        if selected_by_llm is not None and executed_strategy == decision.strategy:
+            candidate = list(selected_by_llm)
+            selected_index: int | None = None
+            selected_score: float | None = None
+        else:
+            if decision.selected_candidate_id and selected_by_llm is None:
+                candidate_override = "unknown_selected_candidate_id"
+            elif decision.selected_candidate_id and executed_strategy != decision.strategy:
+                candidate_override = "candidate_ignored_after_strategy_override"
+            candidate = list(acquisition.selected_x)
+            selected_index = acquisition.selected_index
+            selected_score = acquisition.score
         validator = CandidateValidator(dim=state.benchmark.dim)
-        candidate = list(acquisition.selected_x)
         is_valid, _issues = validator.validate(candidate)
         if not is_valid:
             candidate = validator.repair(candidate)
+            candidate_override = "candidate_repaired" if candidate_override is None else f"{candidate_override};candidate_repaired"
 
         self._pending_trial = {
             "strategy": executed_strategy,
@@ -440,17 +465,82 @@ class WMBOOptimizer:
             "hypothesis_id": hypothesis_record.hypothesis_id if hypothesis_record else None,
             "hypothesis_status": hypothesis_record.status if hypothesis_record else None,
             "hypothesis_status_counts": self._control.hypothesis_status_counts(),
+            "agent_type": agent_type,
+            "llm_error": llm_error,
+            "candidate_options": candidate_options,
+            "candidate_override": candidate_override,
             "wmbo_control": self._control.to_dict(),
         }
         self._last_acquisition = {
             **dict(acquisition.metadata),
-            "score": acquisition.score,
-            "selected_index": acquisition.selected_index,
+            "score": selected_score if selected_score is not None else acquisition.score,
+            "selected_index": selected_index if selected_index is not None else acquisition.selected_index,
             "strategy": executed_strategy,
             "acquisition_strategy": acquisition_strategy,
             "descriptor": descriptor.to_dict(),
         }
         return candidate
+
+    def _decide(
+        self,
+        *,
+        state: OptimizerState,
+        descriptor: LandscapeDescriptor,
+        observed_x: np.ndarray,
+        observed_y: np.ndarray,
+        candidate_options: Sequence[Mapping[str, object]],
+        phase: str,
+    ) -> tuple[Any, str, str | None]:
+        """Return a rule or LLM decision plus source metadata."""
+
+        rule_state = AgentState(
+            observed_x=observed_x.tolist(),
+            observed_y=observed_y.tolist(),
+            descriptor=descriptor.to_dict(),
+            budget_used=state.step,
+            budget_total=self.config.budget,
+        )
+        use_llm = _truthy(self.config.options.get("use_llm_agent", False))
+        if not use_llm:
+            return self._agent.decide(rule_state), "rule", None
+
+        decision_context = {
+            "budget_phase": phase,
+            "remaining_budget": self._control.remaining_budget(state.step, self.config.budget),
+            "consecutive_no_improvement": self._control.consecutive_no_improvement,
+            "strategy_trust": dict(self._control.trusts),
+            "strategy_success_rates": self._control.recent_success_rates(),
+            "recent_hypotheses": self._control.hypothesis_summary(),
+        }
+        try:
+            if self._llm_client is None:
+                self._llm_client = OpenAIStyleClient.from_mapping(_llm_options(self.config.options))
+            decision = decide_with_llm(
+                descriptor,
+                client=self._llm_client,
+                candidates=candidate_options,
+                decision_context=decision_context,
+                model=_optional_str(self.config.options.get("llm_model") or self.config.options.get("api_model")),
+                temperature=float(self.config.options.get("llm_temperature", 0.0)),
+                log_io=_truthy(self.config.options.get("llm_log_io", False)),
+            )
+            return decision, "llm", None
+        except LLMAPIError as exc:
+            if not _truthy(self.config.options.get("llm_fallback_to_rule", True)):
+                raise
+            fallback = self._agent.decide(rule_state)
+            fallback_metadata = dict(fallback.metadata)
+            fallback_metadata["llm_error"] = str(exc)
+            fallback_decision = type(fallback)(
+                strategy=fallback.strategy,
+                hypothesis=fallback.hypothesis,
+                confidence=fallback.confidence,
+                rationale=fallback.rationale,
+                world_model=fallback.world_model,
+                selected_candidate_id=fallback.selected_candidate_id,
+                metadata=fallback_metadata,
+            )
+            return fallback_decision, "rule_fallback", str(exc)
 
     def tell(self, state: OptimizerState, result: EvaluationResult) -> OptimizerState:
         """Update WMBO state after an evaluation.
@@ -633,6 +723,87 @@ def _validate_state(state: OptimizerState) -> None:
         if not math.isfinite(float(observation.y)):
             raise ValueError("Observation outputs must be finite.")
 
+
+
+def _llm_options(options: Mapping[str, object]) -> dict[str, object]:
+    raw = options.get("llm", {}) if isinstance(options, Mapping) else {}
+    data = dict(raw) if isinstance(raw, Mapping) else {}
+    for key in (
+        "api_key",
+        "api_key_env",
+        "base_url",
+        "api_base_url",
+        "model",
+        "api_model",
+        "timeout",
+        "max_retries",
+        "retry_delay_seconds",
+        "request_delay_seconds",
+        "organization",
+        "project",
+    ):
+        if key in options and key not in data:
+            data[key] = options[key]
+    return data
+
+
+def _optional_str(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _truthy(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _build_candidate_options(
+    *,
+    candidate_pool: Matrix | None,
+    prediction_mean: Sequence[float] | None,
+    prediction_std: Sequence[float] | None,
+    observed_x: np.ndarray,
+    observed_y: np.ndarray,
+    dim: int,
+    seed: int,
+    n_points: int,
+) -> list[dict[str, object]]:
+    pool = list(candidate_pool) if candidate_pool is not None else sample_unit_points(n_points=n_points, dim=dim, seed=seed)
+    mean_values = list(prediction_mean) if prediction_mean is not None else [None] * len(pool)
+    std_values = list(prediction_std) if prediction_std is not None else [None] * len(pool)
+    best = observed_x[int(np.argmin(observed_y))] if len(observed_y) else np.full(dim, 0.5)
+    options: list[dict[str, object]] = []
+    for index, x in enumerate(pool):
+        values = [float(v) for v in x]
+        item: dict[str, object] = {
+            "candidate_id": f"c{index}",
+            "x_unit": values,
+            "distance_to_best": float(np.linalg.norm(np.asarray(values, dtype=float) - best)),
+        }
+        if index < len(mean_values) and mean_values[index] is not None:
+            item["surrogate_mean"] = float(mean_values[index])
+        if index < len(std_values) and std_values[index] is not None:
+            item["surrogate_std"] = float(std_values[index])
+        options.append(item)
+    return options
+
+
+def _candidate_from_id(candidate_id: str | None, candidates: Sequence[Mapping[str, object]]) -> list[float] | None:
+    if not candidate_id:
+        return None
+    for candidate in candidates:
+        if str(candidate.get("candidate_id")) == str(candidate_id):
+            x = candidate.get("x_unit")
+            if isinstance(x, Sequence) and not isinstance(x, (str, bytes, bytearray)):
+                return [float(value) for value in x]
+    return None
 
 
 def _wmbo_control_config_from_options(options: Mapping[str, object]) -> WMBOControlConfig:

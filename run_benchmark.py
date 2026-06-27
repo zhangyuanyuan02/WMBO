@@ -13,7 +13,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from wmbo.config import default_run_config, load_run_config, merge_run_config
-from wmbo.control import RunConfig
+from wmbo.control import OptimizerConfig, RunConfig
 from wmbo.runner import run_benchmark_suite
 from wmbo.utils import parse_csv, parse_int_csv
 
@@ -37,6 +37,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--initial-samples", type=int, default=None, help="Initial design size for model-based methods.")
     parser.add_argument("--candidate-pool-size", type=int, default=None, help="Candidate pool size for acquisition search.")
     parser.add_argument("--output-dir", type=str, default=None, help="Directory for JSON and CSV outputs.")
+    parser.add_argument("--use-llm-agent", action="store_true", help="Use an OpenAI-compatible LLM for WMBO decisions.")
+    parser.add_argument("--llm-model", type=str, default=None, help="Model name for the OpenAI-compatible backend.")
+    parser.add_argument("--llm-base-url", type=str, default=None, help="OpenAI-compatible API base URL.")
+    parser.add_argument("--llm-api-key-env", type=str, default=None, help="Environment variable containing the API key.")
+    parser.add_argument("--llm-temperature", type=float, default=None, help="LLM sampling temperature.")
+    parser.add_argument("--llm-log-io", action="store_true", help="Print LLM request and response payloads for debugging.")
+    parser.add_argument("--no-llm-fallback", action="store_true", help="Raise LLM errors instead of falling back to the rule agent.")
     return parser
 
 
@@ -54,7 +61,7 @@ def build_run_config(args: argparse.Namespace) -> RunConfig:
     benchmarks = parse_csv(args.benchmarks) if args.benchmarks else None
     methods = parse_csv(args.methods) if args.methods else None
     seeds = parse_int_csv(args.seeds) if args.seeds else None
-    return merge_run_config(
+    merged = merge_run_config(
         config,
         benchmarks=benchmarks,
         methods=methods,
@@ -64,6 +71,44 @@ def build_run_config(args: argparse.Namespace) -> RunConfig:
         candidate_pool_size=args.candidate_pool_size,
         output_dir=args.output_dir,
     )
+    llm_options = _llm_options_from_args(args)
+    if not llm_options:
+        return merged
+    options = dict(merged.optimizer.options)
+    options.update(llm_options)
+    return RunConfig(
+        benchmarks=merged.benchmarks,
+        methods=merged.methods,
+        seeds=merged.seeds,
+        output_dir=merged.output_dir,
+        optimizer=OptimizerConfig(
+            method=merged.optimizer.method,
+            budget=merged.optimizer.budget,
+            initial_samples=merged.optimizer.initial_samples,
+            candidate_pool_size=merged.optimizer.candidate_pool_size,
+            seed=merged.optimizer.seed,
+            options=options,
+        ),
+    )
+
+
+def _llm_options_from_args(args: argparse.Namespace) -> dict[str, object]:
+    options: dict[str, object] = {}
+    if args.use_llm_agent:
+        options["use_llm_agent"] = True
+    if args.llm_model:
+        options["llm_model"] = args.llm_model
+    if args.llm_base_url:
+        options["api_base_url"] = args.llm_base_url
+    if args.llm_api_key_env:
+        options["api_key_env"] = args.llm_api_key_env
+    if args.llm_temperature is not None:
+        options["llm_temperature"] = float(args.llm_temperature)
+    if args.llm_log_io:
+        options["llm_log_io"] = True
+    if args.no_llm_fallback:
+        options["llm_fallback_to_rule"] = False
+    return options
 
 
 def main() -> None:
