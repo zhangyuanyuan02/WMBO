@@ -1,0 +1,34 @@
+experiment:
+  budget: 8
+  seeds: [0]
+  methods:
+    - wmbo
+  initial_samples: 4
+  candidate_pool_size: 512
+  output_dir: results/llm_debug
+
+benchmark_suite:
+  benchmarks:
+    - branin
+
+optimizer:
+  wmbo_control:
+    early_fraction: 0.35
+    late_fraction: 0.70
+    trust_window: 5
+    failure_cooldown_trials: 2
+    hypothesis_window: 3
+
+llm:
+  enabled: true
+  provider: openai_compatible
+  model: gpt-4o-mini
+  base_url: https://api.openai.com/v1
+  api_key_env: OPENAI_API_KEY
+  temperature: 0.0
+  fallback_to_rule: true
+  log_io: false
+  timeout: 120
+  max_retries: 3
+  retry_delay_seconds: 2
+  request_delay_seconds: 0

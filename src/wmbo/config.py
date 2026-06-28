@@ -42,6 +42,10 @@ def run_config_from_mapping(data: Mapping[str, Any]) -> RunConfig:
     experiment = _mapping(data.get("experiment", {}), section="experiment")
     optimizer_section = _mapping(data.get("optimizer", {}), section="optimizer")
     suite = _mapping(data.get("benchmark_suite", {}), section="benchmark_suite")
+    llm_section = _mapping(
+        data.get("llm", data.get("llm_agent", optimizer_section.get("llm", {}))),
+        section="llm",
+    )
 
     benchmarks = _as_str_list(suite.get("benchmarks", data.get("benchmarks", ["branin"])))
     methods = _as_str_list(experiment.get("methods", data.get("methods", ["random"])))
@@ -61,7 +65,10 @@ def run_config_from_mapping(data: Mapping[str, Any]) -> RunConfig:
     )
     output_dir = str(experiment.get("output_dir", data.get("output_dir", "results")))
     options = dict(_mapping(optimizer_section.get("options", {}), section="optimizer.options"))
-    control_options = optimizer_section.get("wmbo_control", data.get("wmbo_control", {}))
+    llm_options = _normalise_llm_options(llm_section)
+    if llm_options:
+        options.update(llm_options)
+    control_options = optimizer_section.get("wmbo_control", data.get("wmbo_control", data.get("wmbo", {})))
     if control_options is not None:
         control_mapping = _mapping(control_options, section="optimizer.wmbo_control")
         if control_mapping:
@@ -165,6 +172,79 @@ def default_run_config() -> RunConfig:
 
     return run_config_from_mapping({})
 
+
+
+def _normalise_llm_options(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Convert a YAML ``llm`` section into optimiser options.
+
+    Inputs:
+        value: Optional top-level ``llm`` mapping from an experiment config.
+
+    Output:
+        Normalised options consumed by ``WMBOOptimizer`` and ``OpenAIStyleClient``.
+    """
+
+    if not value:
+        return {}
+
+    options: dict[str, Any] = {}
+    enabled = value.get("enabled", value.get("use_llm_agent", False))
+    if _truthy(enabled):
+        options["use_llm_agent"] = True
+
+    key_map = {
+        "model": "llm_model",
+        "api_model": "api_model",
+        "base_url": "api_base_url",
+        "api_base_url": "api_base_url",
+        "api_key": "api_key",
+        "api_key_env": "api_key_env",
+        "key_env": "api_key_env",
+        "temperature": "llm_temperature",
+        "log_io": "llm_log_io",
+        "fallback_to_rule": "llm_fallback_to_rule",
+        "timeout": "timeout",
+        "max_retries": "max_retries",
+        "retry_delay_seconds": "retry_delay_seconds",
+        "request_delay_seconds": "request_delay_seconds",
+        "organization": "organization",
+        "project": "project",
+        "provider": "api_provider",
+        "api_provider": "api_provider",
+    }
+    for source_key, target_key in key_map.items():
+        if source_key in value and value[source_key] is not None:
+            options[target_key] = value[source_key]
+
+    nested_llm = {
+        key: options[key]
+        for key in (
+            "api_key",
+            "api_key_env",
+            "api_base_url",
+            "api_model",
+            "timeout",
+            "max_retries",
+            "retry_delay_seconds",
+            "request_delay_seconds",
+            "organization",
+            "project",
+        )
+        if key in options
+    }
+    if "llm_model" in options and "api_model" not in nested_llm:
+        nested_llm["model"] = options["llm_model"]
+    if nested_llm:
+        options["llm"] = nested_llm
+    return options
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
 
 def _mapping(value: Any, *, section: str) -> Mapping[str, Any]:
     if value is None:

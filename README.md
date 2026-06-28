@@ -2,7 +2,7 @@
 
 Initial repository for a research project on world-model reasoning for black-box optimisation.
 
-This repository is still at an early implementation stage. The current commit adds an optional OpenAI-compatible LLM backend for WMBO decisions while keeping the rule-based controller as the default fallback.
+This repository is still at an early implementation stage. The current commit adds YAML configuration files for OpenAI-compatible LLM WMBO experiments while keeping API keys out of version control.
 
 ## Structure
 
@@ -36,7 +36,8 @@ Implemented so far:
   - retry/timeout handling
   - fallback to the rule-based agent
 - Minimal benchmark runner with JSON/CSV output
-- YAML configuration files for reproducible runs
+- YAML configuration files for reproducible rule-based and LLM-assisted runs
+- LLM debug config and local secrets template
 - Plotting utilities for saved runner outputs
 
 ## Examples
@@ -47,10 +48,16 @@ Run the default CLI settings:
 python run_benchmark.py --benchmarks branin --methods random,wmbo --seeds 0 --budget 10
 ```
 
-Run from a checked-in config:
+Run from a checked-in rule-based config:
 
 ```bash
 python run_benchmark.py --config configs/debug.yaml
+```
+
+Run the LLM-assisted debug config. Without an API key, WMBO falls back to the rule-based agent by default:
+
+```bash
+python run_benchmark.py --config configs/llm_debug.yaml
 ```
 
 Command-line values can override config values:
@@ -89,35 +96,33 @@ The control state is still applied after an LLM decision, so the LLM proposes a 
 
 ## Optional LLM backend
 
-The default WMBO method remains rule based. To use a remote OpenAI-compatible backend, pass CLI options and keep secrets in environment variables:
+The default WMBO method remains rule based unless a config or CLI option enables the LLM agent. The checked-in LLM config uses an environment variable for the key:
 
 ```bash
 export OPENAI_API_KEY=...
-python run_benchmark.py \
-  --benchmarks branin \
-  --methods wmbo \
-  --budget 10 \
-  --use-llm-agent \
-  --llm-model gpt-4o-mini
+python run_benchmark.py --config configs/llm_debug.yaml
 ```
 
-For compatible providers, set a base URL or API-key environment variable explicitly:
+For compatible providers, either edit a local copy of the config or override the checked-in config from the CLI:
 
 ```bash
 export SILICONFLOW_API_KEY=...
 python run_benchmark.py \
-  --benchmarks branin \
-  --methods wmbo \
-  --budget 10 \
-  --use-llm-agent \
+  --config configs/llm_debug.yaml \
   --llm-base-url https://api.siliconflow.cn/v1 \
   --llm-api-key-env SILICONFLOW_API_KEY \
   --llm-model Qwen/Qwen2.5-72B-Instruct
 ```
 
-LLM configuration files are intentionally not added in this commit. They are the next step after the API client is in place.
+For private local settings, copy the example secrets file and keep the copy untracked:
+
+```bash
+cp configs/llm_secrets.example.yaml configs/llm_secrets.yaml
+python run_benchmark.py --config configs/llm_secrets.yaml
+```
+
+The ignored `configs/llm_secrets.yaml` file may contain provider-specific keys or model names for local experiments. Prefer `api_key_env` over writing keys directly in YAML.
 
 ## TODO
 
-- Add LLM experiment config templates
 - Add tests and result analysis
