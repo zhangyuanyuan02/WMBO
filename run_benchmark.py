@@ -14,6 +14,7 @@ if str(SRC_DIR) not in sys.path:
 
 from wmbo.config import default_run_config, load_run_config, merge_run_config
 from wmbo.control import OptimizerConfig, RunConfig
+from wmbo.llm_api import API_PROVIDER_ENV, available_api_providers
 from wmbo.runner import run_benchmark_suite
 from wmbo.utils import parse_csv, parse_int_csv
 
@@ -41,6 +42,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--llm-model", type=str, default=None, help="Model name for the OpenAI-compatible backend.")
     parser.add_argument("--llm-base-url", type=str, default=None, help="OpenAI-compatible API base URL.")
     parser.add_argument("--llm-api-key-env", type=str, default=None, help="Environment variable containing the API key.")
+    parser.add_argument("--api-provider", type=str, default=None, help="Provider name from configs/llm_secrets.yaml.")
+    parser.add_argument("--list-api-providers", action="store_true", help="List configured API providers and exit.")
     parser.add_argument("--llm-temperature", type=float, default=None, help="LLM sampling temperature.")
     parser.add_argument("--llm-log-io", action="store_true", help="Print LLM request and response payloads for debugging.")
     parser.add_argument("--no-llm-fallback", action="store_true", help="Raise LLM errors instead of falling back to the rule agent.")
@@ -96,6 +99,8 @@ def _llm_options_from_args(args: argparse.Namespace) -> dict[str, object]:
     options: dict[str, object] = {}
     if args.use_llm_agent:
         options["use_llm_agent"] = True
+    if args.api_provider:
+        options["api_provider"] = args.api_provider
     if args.llm_model:
         options["llm_model"] = args.llm_model
     if args.llm_base_url:
@@ -123,6 +128,18 @@ def main() -> None:
 
     parser = build_parser()
     args = parser.parse_args()
+    if args.list_api_providers:
+        providers = available_api_providers()
+        print("\n".join(providers) if providers else "No API providers configured.")
+        return
+    if args.api_provider:
+        import os
+
+        providers = available_api_providers()
+        if providers and args.api_provider not in providers:
+            parser.error(f"unknown API provider {args.api_provider!r}; choose from: {', '.join(providers)}")
+        os.environ[API_PROVIDER_ENV] = args.api_provider
+        print(f"[llm] api_provider={args.api_provider}")
     config = build_run_config(args)
     results = run_benchmark_suite(config)
 

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import json
 import math
 import os
+from pathlib import Path
 import time
 from typing import Any, Mapping, Protocol, Sequence
 
@@ -27,6 +28,69 @@ WORLD_MODEL_LABELS: dict[str, set[str]] = {
 
 class LLMAPIError(RuntimeError):
     """Raised when a remote LLM call or response parse fails."""
+
+
+def _candidate_secret_paths() -> list[Path]:
+    project_root = Path(__file__).resolve().parents[2]
+    return [
+        Path.cwd() / "configs" / "llm_secrets.yaml",
+        project_root / "configs" / "llm_secrets.yaml",
+    ]
+
+
+def resolve_provider_config(data: Mapping[str, Any], provider: str | None = None) -> dict[str, Any]:
+    """Resolve one API provider section from a local secrets mapping."""
+
+    providers = data.get("providers")
+    selected = provider or os.getenv(API_PROVIDER_ENV) or data.get("active_provider")
+    if isinstance(providers, Mapping):
+        if not selected:
+            raise LLMAPIError(f"Select an API provider with active_provider or {API_PROVIDER_ENV}.")
+        section = providers.get(str(selected))
+        if not isinstance(section, Mapping):
+            available = ", ".join(sorted(str(name) for name in providers))
+            raise LLMAPIError(f"Unknown API provider {selected!r}. Available providers: {available}.")
+    elif selected and isinstance(data.get(str(selected)), Mapping):
+        section = data[str(selected)]
+    elif selected and isinstance(data.get(str(selected).lower()), Mapping):
+        section = data[str(selected).lower()]
+    elif selected:
+        lower_to_key = {str(key).lower(): key for key in data}
+        matched_key = lower_to_key.get(str(selected).lower())
+        if matched_key is not None and isinstance(data.get(matched_key), Mapping):
+            section = data[matched_key]
+        else:
+            section = data.get("openai") or data.get("llm") or data.get("llm_agent") or data
+    else:
+        section = data.get("openai") or data.get("llm") or data.get("llm_agent") or data
+
+    if not isinstance(section, Mapping):
+        raise LLMAPIError("Local LLM config section must be a YAML object.")
+
+    config = dict(section)
+    if "url" in config and "base_url" not in config:
+        config["base_url"] = config["url"]
+    if "default_model" in config and "model" not in config:
+        config["model"] = config["default_model"]
+    return config
+
+
+def load_local_llm_config(provider: str | None = None) -> dict[str, Any]:
+    """Load optional local LLM credentials from configs/llm_secrets.yaml."""
+
+    path = next((candidate for candidate in _candidate_secret_paths() if candidate.exists()), None)
+    if path is None:
+        return {}
+    try:
+        import yaml
+    except ImportError as exc:
+        raise LLMAPIError("Reading configs/llm_secrets.yaml requires PyYAML.") from exc
+
+    with path.open("r", encoding="utf-8") as file:
+        data = yaml.safe_load(file) or {}
+    if not isinstance(data, Mapping):
+        raise LLMAPIError(f"Local LLM config must be a YAML object: {path}")
+    return resolve_provider_config(data, provider=provider)
 
 
 @dataclass(frozen=True)
@@ -74,36 +138,44 @@ class LLMClientConfig:
     def from_env(cls) -> "LLMClientConfig":
         """Build a client config from environment variables."""
 
+        local = load_local_llm_config()
         return cls(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-            default_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            timeout=float(os.getenv("OPENAI_TIMEOUT", "120")),
-            max_retries=int(os.getenv("OPENAI_MAX_RETRIES", "3")),
-            retry_delay_seconds=float(os.getenv("OPENAI_RETRY_DELAY_SECONDS", "2")),
-            request_delay_seconds=float(os.getenv("OPENAI_REQUEST_DELAY_SECONDS", "0")),
-            organization=os.getenv("OPENAI_ORG_ID"),
-            project=os.getenv("OPENAI_PROJECT_ID"),
+            api_key=os.getenv("OPENAI_API_KEY") or local.get("api_key"),
+            base_url=os.getenv("OPENAI_BASE_URL") or str(local.get("base_url", "https://api.openai.com/v1")),
+            default_model=os.getenv("OPENAI_MODEL") or str(local.get("model", "gpt-4o-mini")),
+            timeout=float(os.getenv("OPENAI_TIMEOUT") or local.get("timeout", 120)),
+            max_retries=int(os.getenv("OPENAI_MAX_RETRIES") or local.get("max_retries", 3)),
+            retry_delay_seconds=float(os.getenv("OPENAI_RETRY_DELAY_SECONDS") or local.get("retry_delay_seconds", 2)),
+            request_delay_seconds=float(os.getenv("OPENAI_REQUEST_DELAY_SECONDS") or local.get("request_delay_seconds", 0)),
+            organization=os.getenv("OPENAI_ORG_ID") or local.get("organization"),
+            project=os.getenv("OPENAI_PROJECT_ID") or local.get("project"),
         )
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "LLMClientConfig":
         """Build a client config from direct optimiser options."""
 
-        key_env = data.get("api_key_env") or data.get("key_env")
-        api_key = data.get("api_key")
+        provider = data.get("api_provider") or data.get("provider")
+        local = load_local_llm_config(provider=str(provider)) if provider else load_local_llm_config()
+        merged = {**local, **dict(data)}
+
+        key_env = merged.get("api_key_env") or merged.get("key_env")
+        api_key = merged.get("api_key")
         if not api_key and key_env:
-            api_key = os.getenv(str(key_env))
+            key_env_text = str(key_env)
+            api_key = os.getenv(key_env_text)
+            if not api_key and key_env_text.startswith("sk-"):
+                api_key = key_env_text
         return cls(
             api_key=str(api_key) if api_key else os.getenv("OPENAI_API_KEY"),
-            base_url=str(data.get("base_url") or data.get("api_base_url") or os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")),
-            default_model=str(data.get("model") or data.get("api_model") or os.getenv("OPENAI_MODEL", "gpt-4o-mini")),
-            timeout=float(data.get("timeout", os.getenv("OPENAI_TIMEOUT", "120"))),
-            max_retries=int(data.get("max_retries", os.getenv("OPENAI_MAX_RETRIES", "3"))),
-            retry_delay_seconds=float(data.get("retry_delay_seconds", os.getenv("OPENAI_RETRY_DELAY_SECONDS", "2"))),
-            request_delay_seconds=float(data.get("request_delay_seconds", os.getenv("OPENAI_REQUEST_DELAY_SECONDS", "0"))),
-            organization=str(data.get("organization") or os.getenv("OPENAI_ORG_ID") or "") or None,
-            project=str(data.get("project") or os.getenv("OPENAI_PROJECT_ID") or "") or None,
+            base_url=str(merged.get("base_url") or merged.get("api_base_url") or os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")),
+            default_model=str(merged.get("model") or merged.get("api_model") or os.getenv("OPENAI_MODEL", "gpt-4o-mini")),
+            timeout=float(merged.get("timeout", os.getenv("OPENAI_TIMEOUT", "120"))),
+            max_retries=int(merged.get("max_retries", os.getenv("OPENAI_MAX_RETRIES", "3"))),
+            retry_delay_seconds=float(merged.get("retry_delay_seconds", os.getenv("OPENAI_RETRY_DELAY_SECONDS", "2"))),
+            request_delay_seconds=float(merged.get("request_delay_seconds", os.getenv("OPENAI_REQUEST_DELAY_SECONDS", "0"))),
+            organization=str(merged.get("organization") or os.getenv("OPENAI_ORG_ID") or "") or None,
+            project=str(merged.get("project") or os.getenv("OPENAI_PROJECT_ID") or "") or None,
         )
 
 
@@ -469,14 +541,23 @@ def decide_with_llm(
 
 
 def available_api_providers() -> list[str]:
-    """Return configured provider names.
+    """Return provider names configured in configs/llm_secrets.yaml."""
 
-    Provider config files are intentionally introduced later. For now, the
-    remote client is configured by environment variables or direct options.
-    """
-
-    provider = os.getenv(API_PROVIDER_ENV)
-    return [provider] if provider else []
+    path = next((candidate for candidate in _candidate_secret_paths() if candidate.exists()), None)
+    if path is None:
+        return []
+    try:
+        import yaml
+    except ImportError as exc:
+        raise LLMAPIError("Reading configs/llm_secrets.yaml requires PyYAML.") from exc
+    with path.open("r", encoding="utf-8") as file:
+        data = yaml.safe_load(file) or {}
+    if not isinstance(data, Mapping):
+        return []
+    providers = data.get("providers")
+    if isinstance(providers, Mapping):
+        return sorted(str(name) for name in providers)
+    return []
 
 
 __all__ = [
@@ -492,6 +573,8 @@ __all__ = [
     "decide_with_llm",
     "extract_message_text",
     "inspect_reasoning_response",
+    "load_local_llm_config",
     "normalise_world_model",
     "parse_reasoning_decision",
+    "resolve_provider_config",
 ]

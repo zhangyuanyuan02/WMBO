@@ -27,3 +27,8 @@ benchmark_suite:
     - levy5
     - griewank5
     - styblinski5
+
+llm:
+  enabled: true
+  provider: siliconflow
+  fallback_to_rule: true

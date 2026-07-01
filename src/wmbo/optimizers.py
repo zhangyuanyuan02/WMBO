@@ -741,6 +741,8 @@ def _llm_options(options: Mapping[str, object]) -> dict[str, object]:
         "request_delay_seconds",
         "organization",
         "project",
+        "api_provider",
+        "provider",
     ):
         if key in options and key not in data:
             data[key] = options[key]
