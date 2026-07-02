@@ -373,15 +373,14 @@ class WMBOOptimizer:
             },
         )
         phase = self._control.budget_phase(state.step, self.config.budget)
-        candidate_options = _build_candidate_options(
-            candidate_pool=None,
-            prediction_mean=None,
-            prediction_std=None,
+        candidate_options = _build_strategy_candidate_options(
+            surrogate=surrogate,
             observed_x=observed_x,
             observed_y=observed_y,
             dim=state.benchmark.dim,
+            n_pool=max(1, self.config.candidate_pool_size),
+            n_options_per_strategy=max(1, int(self._control.config.candidate_options_per_strategy)),
             seed=self.config.seed + 25_000 + state.step,
-            n_points=max(8, min(self.config.candidate_pool_size, 64)),
         )
         decision, agent_type, llm_error = self._decide(
             state=state,
@@ -407,40 +406,12 @@ class WMBOOptimizer:
             baseline_best=float(np.min(observed_y)),
         )
 
-        candidate_pool = _make_wmbo_candidate_pool(
+        selected_option, candidate_override = _select_strategy_candidate(
+            candidate_options,
             strategy=executed_strategy,
-            observed_x=observed_x,
-            observed_y=observed_y,
-            dim=state.benchmark.dim,
-            n_points=max(1, self.config.candidate_pool_size),
-            seed=self.config.seed + 30_000 + state.step,
+            requested_candidate_id=decision.selected_candidate_id,
         )
-        prediction = surrogate.predict(candidate_pool)
-        acquisition_strategy = _strategy_to_acquisition(executed_strategy)
-        acquisition = select_next_candidate(
-            AcquisitionInput(
-                candidates=candidate_pool,
-                observed_x=observed_x.tolist(),
-                observed_y=observed_y.tolist(),
-                surrogate_mean=prediction.mean,
-                surrogate_std=prediction.std,
-                strategy=acquisition_strategy,
-            )
-        )
-        selected_by_llm = _candidate_from_id(decision.selected_candidate_id, candidate_options)
-        candidate_override: str | None = None
-        if selected_by_llm is not None and executed_strategy == decision.strategy:
-            candidate = list(selected_by_llm)
-            selected_index: int | None = None
-            selected_score: float | None = None
-        else:
-            if decision.selected_candidate_id and selected_by_llm is None:
-                candidate_override = "unknown_selected_candidate_id"
-            elif decision.selected_candidate_id and executed_strategy != decision.strategy:
-                candidate_override = "candidate_ignored_after_strategy_override"
-            candidate = list(acquisition.selected_x)
-            selected_index = acquisition.selected_index
-            selected_score = acquisition.score
+        candidate = list(selected_option["x_unit"])
         validator = CandidateValidator(dim=state.benchmark.dim)
         is_valid, _issues = validator.validate(candidate)
         if not is_valid:
@@ -472,11 +443,12 @@ class WMBOOptimizer:
             "wmbo_control": self._control.to_dict(),
         }
         self._last_acquisition = {
-            **dict(acquisition.metadata),
-            "score": selected_score if selected_score is not None else acquisition.score,
-            "selected_index": selected_index if selected_index is not None else acquisition.selected_index,
+            "score": selected_option.get("acquisition_score"),
+            "selected_candidate_id": selected_option.get("candidate_id"),
             "strategy": executed_strategy,
-            "acquisition_strategy": acquisition_strategy,
+            "acquisition_strategy": selected_option.get("acquisition_strategy"),
+            "surrogate_mean": selected_option.get("surrogate_mean"),
+            "surrogate_std": selected_option.get("surrogate_std"),
             "descriptor": descriptor.to_dict(),
         }
         return candidate
@@ -766,46 +738,93 @@ def _truthy(value: object) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def _build_candidate_options(
+def _build_strategy_candidate_options(
     *,
-    candidate_pool: Matrix | None,
-    prediction_mean: Sequence[float] | None,
-    prediction_std: Sequence[float] | None,
+    surrogate: Any,
     observed_x: np.ndarray,
     observed_y: np.ndarray,
     dim: int,
+    n_pool: int,
+    n_options_per_strategy: int,
     seed: int,
-    n_points: int,
 ) -> list[dict[str, object]]:
-    pool = list(candidate_pool) if candidate_pool is not None else sample_unit_points(n_points=n_points, dim=dim, seed=seed)
-    mean_values = list(prediction_mean) if prediction_mean is not None else [None] * len(pool)
-    std_values = list(prediction_std) if prediction_std is not None else [None] * len(pool)
+    """Build scored candidate options grouped by WMBO strategy."""
+
     best = observed_x[int(np.argmin(observed_y))] if len(observed_y) else np.full(dim, 0.5)
     options: list[dict[str, object]] = []
-    for index, x in enumerate(pool):
-        values = [float(v) for v in x]
-        item: dict[str, object] = {
-            "candidate_id": f"c{index}",
-            "x_unit": values,
-            "distance_to_best": float(np.linalg.norm(np.asarray(values, dtype=float) - best)),
-        }
-        if index < len(mean_values) and mean_values[index] is not None:
-            item["surrogate_mean"] = float(mean_values[index])
-        if index < len(std_values) and std_values[index] is not None:
-            item["surrogate_std"] = float(std_values[index])
-        options.append(item)
+    for strategy_index, strategy in enumerate(STRATEGIES):
+        acquisition_strategy = _strategy_to_acquisition(strategy)
+        for option_index in range(max(1, n_options_per_strategy)):
+            option_seed = int(seed) + strategy_index * 10_000 + option_index
+            pool = _make_wmbo_candidate_pool(
+                strategy=strategy,
+                observed_x=observed_x,
+                observed_y=observed_y,
+                dim=dim,
+                n_points=n_pool,
+                seed=option_seed,
+            )
+            prediction = surrogate.predict(pool)
+            acquisition = select_next_candidate(
+                AcquisitionInput(
+                    candidates=pool,
+                    observed_x=observed_x.tolist(),
+                    observed_y=observed_y.tolist(),
+                    surrogate_mean=prediction.mean,
+                    surrogate_std=prediction.std,
+                    strategy=acquisition_strategy,
+                )
+            )
+            x = [float(value) for value in acquisition.selected_x]
+            selected_index = int(acquisition.selected_index)
+            options.append(
+                {
+                    "candidate_id": f"{strategy}_{option_index + 1}",
+                    "strategy": strategy,
+                    "x_unit": x,
+                    "acquisition_strategy": acquisition_strategy,
+                    "acquisition_score": float(acquisition.score),
+                    "surrogate_mean": float(prediction.mean[selected_index]),
+                    "surrogate_std": float(prediction.std[selected_index]),
+                    "distance_to_best": float(np.linalg.norm(np.asarray(x, dtype=float) - best)),
+                    "distance_to_nearest_observation": _distance_to_nearest_observation(x, observed_x),
+                }
+            )
     return options
 
 
-def _candidate_from_id(candidate_id: str | None, candidates: Sequence[Mapping[str, object]]) -> list[float] | None:
-    if not candidate_id:
-        return None
-    for candidate in candidates:
-        if str(candidate.get("candidate_id")) == str(candidate_id):
-            x = candidate.get("x_unit")
-            if isinstance(x, Sequence) and not isinstance(x, (str, bytes, bytearray)):
-                return [float(value) for value in x]
-    return None
+def _select_strategy_candidate(
+    candidates: Sequence[Mapping[str, object]],
+    *,
+    strategy: str,
+    requested_candidate_id: str | None,
+) -> tuple[Mapping[str, object], str | None]:
+    matching = [candidate for candidate in candidates if str(candidate.get("strategy")) == strategy]
+    if not matching:
+        raise ValueError(f"No candidate options available for strategy: {strategy}")
+
+    if requested_candidate_id:
+        requested = next(
+            (candidate for candidate in matching if str(candidate.get("candidate_id")) == requested_candidate_id),
+            None,
+        )
+        if requested is not None:
+            return requested, None
+        known = any(str(candidate.get("candidate_id")) == requested_candidate_id for candidate in candidates)
+        reason = "candidate_ignored_after_strategy_override" if known else "unknown_selected_candidate_id"
+    else:
+        reason = "candidate_id_missing"
+
+    selected = max(matching, key=lambda candidate: float(candidate.get("acquisition_score", float("-inf"))))
+    return selected, reason
+
+
+def _distance_to_nearest_observation(candidate: Sequence[float], observed_x: np.ndarray) -> float:
+    if len(observed_x) == 0:
+        return 1.0
+    x = np.asarray(candidate, dtype=float)
+    distances = np.linalg.norm(observed_x - x[None, :], axis=1)
+    return float(np.min(distances))
 
 
 def _wmbo_control_config_from_options(options: Mapping[str, object]) -> WMBOControlConfig:

@@ -75,11 +75,21 @@ def run_single_benchmark(request: BenchmarkRunRequest) -> BenchmarkRunResult:
     optimizer_config = _make_optimizer_config(request)
     optimizer = make_optimizer(request.method, optimizer_config)
     state = create_initial_state(benchmark)
+    log_enabled = _logging_enabled(request.metadata)
+    run_label = _run_label(request)
+
+    if log_enabled:
+        _log(
+            f"{run_label} start benchmark={benchmark.name} dim={benchmark.dim} "
+            f"method={request.method} seed={request.seed} budget={request.budget}"
+        )
 
     observations: list[dict[str, object]] = []
     objective_values: list[float] = []
 
     for step in range(request.budget):
+        if log_enabled:
+            _log(f"{run_label} step {step + 1}/{request.budget} ask")
         x_unit = optimizer.ask(state)
         result = evaluate(
             EvaluationRequest(
@@ -93,20 +103,23 @@ def run_single_benchmark(request: BenchmarkRunRequest) -> BenchmarkRunResult:
         best_curve = cumulative_best(objective_values, minimise=True)
         regret_curve = simple_regret(best_curve, benchmark.optimum_value)
         optimiser_metadata = _extract_observation_metadata(state.metadata)
+        observation = {
+            "step": step,
+            "benchmark": benchmark.name,
+            "method": request.method,
+            "seed": request.seed,
+            "x_unit": [float(value) for value in result.x_unit],
+            "x_raw": [float(value) for value in result.x_raw],
+            "y": float(result.y),
+            "best_y": best_curve[-1],
+            "simple_regret": regret_curve[-1],
+            **optimiser_metadata,
+        }
         observations.append(
-            {
-                "step": step,
-                "benchmark": benchmark.name,
-                "method": request.method,
-                "seed": request.seed,
-                "x_unit": [float(value) for value in result.x_unit],
-                "x_raw": [float(value) for value in result.x_raw],
-                "y": float(result.y),
-                "best_y": best_curve[-1],
-                "simple_regret": regret_curve[-1],
-                **optimiser_metadata,
-            }
+            observation
         )
+        if log_enabled:
+            _log(_format_step_log(run_label, step + 1, request.budget, observation))
 
     summary = summarise_run(
         benchmark_name=benchmark.name,
@@ -129,6 +142,11 @@ def run_single_benchmark(request: BenchmarkRunRequest) -> BenchmarkRunResult:
     )
     if request.output_dir:
         save_run_result(result, request.output_dir)
+    if log_enabled:
+        _log(
+            f"{run_label} done final_best={_format_number(summary.final_best)} "
+            f"final_regret={_format_number(summary.final_regret)} output={request.output_dir or '<memory>'}"
+        )
     return result
 
 
@@ -147,9 +165,19 @@ def run_benchmark_suite(config: RunConfig) -> list[BenchmarkRunResult]:
     seeds = list(config.seeds) or [0]
 
     results: list[BenchmarkRunResult] = []
+    total_runs = len(benchmarks) * len(methods) * len(seeds)
+    run_index = 0
+    suite_logging = _logging_enabled(config.optimizer.options)
+    if suite_logging:
+        _log(
+            f"[suite] start benchmarks={len(benchmarks)} methods={len(methods)} "
+            f"seeds={len(seeds)} total_runs={total_runs} budget={config.optimizer.budget} "
+            f"output={config.output_dir}"
+        )
     for benchmark_name in benchmarks:
         for method in methods:
             for seed in seeds:
+                run_index += 1
                 request = BenchmarkRunRequest(
                     benchmark_name=benchmark_name,
                     method=method,
@@ -160,12 +188,24 @@ def run_benchmark_suite(config: RunConfig) -> list[BenchmarkRunResult]:
                         "initial_samples": config.optimizer.initial_samples,
                         "candidate_pool_size": config.optimizer.candidate_pool_size,
                         "options": dict(config.optimizer.options),
+                        "run_index": run_index,
+                        "total_runs": total_runs,
                     },
                 )
-                results.append(run_single_benchmark(request))
+                try:
+                    results.append(run_single_benchmark(request))
+                except Exception as exc:
+                    if suite_logging:
+                        _log(
+                            f"[run {run_index}/{total_runs}] failed "
+                            f"benchmark={benchmark_name} method={method} seed={seed}: {exc}"
+                        )
+                    raise
 
     if config.output_dir:
         save_suite_summary(results, config.output_dir)
+    if suite_logging:
+        _log(f"[suite] done completed_runs={len(results)} output={config.output_dir}")
     return results
 
 
@@ -337,6 +377,72 @@ def _to_jsonable(value: Any) -> Any:
     if hasattr(value, "item"):
         return value.item()
     return value
+
+
+def _logging_enabled(metadata: Mapping[str, object]) -> bool:
+    raw_options = metadata.get("options", metadata) if isinstance(metadata, Mapping) else {}
+    options = raw_options if isinstance(raw_options, Mapping) else {}
+    logging_options = options.get("logging", {}) if isinstance(options, Mapping) else {}
+    if isinstance(logging_options, Mapping):
+        return _truthy(logging_options.get("verbose", True))
+    return True
+
+
+def _truthy(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _run_label(request: BenchmarkRunRequest) -> str:
+    run_index = request.metadata.get("run_index") if isinstance(request.metadata, Mapping) else None
+    total_runs = request.metadata.get("total_runs") if isinstance(request.metadata, Mapping) else None
+    if run_index is not None and total_runs is not None:
+        return f"[run {run_index}/{total_runs}]"
+    return "[run]"
+
+
+def _format_step_log(
+    run_label: str,
+    step_number: int,
+    budget: int,
+    observation: Mapping[str, object],
+) -> str:
+    parts = [
+        f"{run_label} step {step_number}/{budget}",
+        f"y={_format_number(observation.get('y'))}",
+        f"best={_format_number(observation.get('best_y'))}",
+    ]
+    agent = observation.get("agent_type")
+    strategy = observation.get("executed_strategy") or observation.get("strategy")
+    phase = observation.get("budget_phase")
+    if agent:
+        parts.append(f"agent={agent}")
+    if strategy:
+        parts.append(f"strategy={strategy}")
+    if phase:
+        parts.append(f"phase={phase}")
+    llm_error = observation.get("llm_error")
+    if llm_error:
+        parts.append(f"llm_error={str(llm_error)[:160]}")
+    return " ".join(parts)
+
+
+def _log(message: str) -> None:
+    print(message, flush=True)
+
+
+def _format_number(value: object) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        return f"{float(value):.6g}"
+    except (TypeError, ValueError):
+        return str(value)
 
 
 __all__ = [

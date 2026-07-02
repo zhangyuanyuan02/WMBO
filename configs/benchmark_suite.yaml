@@ -10,7 +10,7 @@ experiment:
     - simple_es
     - wmbo
   initial_samples: 5
-  candidate_pool_size: 1024
+  candidate_pool_size: 2048
   output_dir: results/benchmark_suite
 
 optimizer:
@@ -32,3 +32,9 @@ llm:
   enabled: true
   provider: siliconflow
   fallback_to_rule: true
+
+logging:
+  verbose: true
+
+wmbo:
+  candidate_options_per_strategy: 5

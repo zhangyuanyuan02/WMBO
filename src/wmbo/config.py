@@ -42,6 +42,7 @@ def run_config_from_mapping(data: Mapping[str, Any]) -> RunConfig:
     experiment = _mapping(data.get("experiment", {}), section="experiment")
     optimizer_section = _mapping(data.get("optimizer", {}), section="optimizer")
     suite = _mapping(data.get("benchmark_suite", {}), section="benchmark_suite")
+    logging_section = _mapping(data.get("logging", {}), section="logging")
     llm_section = _mapping(
         data.get("llm", data.get("llm_agent", optimizer_section.get("llm", {}))),
         section="llm",
@@ -65,6 +66,8 @@ def run_config_from_mapping(data: Mapping[str, Any]) -> RunConfig:
     )
     output_dir = str(experiment.get("output_dir", data.get("output_dir", "results")))
     options = dict(_mapping(optimizer_section.get("options", {}), section="optimizer.options"))
+    if logging_section:
+        options["logging"] = dict(logging_section)
     llm_options = _normalise_llm_options(llm_section)
     if llm_options:
         options.update(llm_options)
