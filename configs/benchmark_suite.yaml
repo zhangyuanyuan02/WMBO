@@ -1,6 +1,6 @@
 experiment:
   budget: 30
-  seeds: [0, 1, 2]
+  seeds: [0]
   methods:
     - random
     - sobol
@@ -38,3 +38,10 @@ logging:
 
 wmbo:
   candidate_options_per_strategy: 5
+  hypothesis_alignment_weight: 0.15
+  gp_verifier_enabled: true
+  gp_verifier_min_score_ratio: 0.75
+  gp_verifier_duplicate_distance: 0.0001
+  multimodal_explore_interval: 4
+  multimodal_explore_uncertainty_threshold: 0.30
+  multimodal_late_explore_uncertainty_threshold: 0.45

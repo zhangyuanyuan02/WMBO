@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+import math
 from typing import Any, Mapping, Sequence
 
 
@@ -94,6 +95,13 @@ class WMBOControlConfig:
         hypothesis_window: Number of trials before an active hypothesis expires.
         middle_global_uncertainty_threshold: Minimum uncertainty for middle-phase global exploration.
         late_explore_uncertainty_threshold: Minimum uncertainty for late exploration.
+        multimodal_explore_interval: Maximum non-exploratory gap tolerated on multimodal landscapes.
+        multimodal_explore_uncertainty_threshold: Minimum uncertainty for multimodal exploration in early/middle phases.
+        multimodal_late_explore_uncertainty_threshold: Minimum uncertainty for late multimodal exploration.
+        hypothesis_alignment_weight: Soft candidate-selection weight for active hypothesis regions.
+        gp_verifier_enabled: Whether GP acquisition/uncertainty can refine LLM-selected candidates.
+        gp_verifier_min_score_ratio: Minimum acceptable candidate score ratio against the best same-strategy option.
+        gp_verifier_duplicate_distance: Minimum distance from observed points before a candidate is considered duplicate-like.
 
     Output:
         Passed to ``WMBOState``.
@@ -111,6 +119,13 @@ class WMBOControlConfig:
     hypothesis_window: int = 3
     middle_global_uncertainty_threshold: float = 0.55
     late_explore_uncertainty_threshold: float = 0.65
+    multimodal_explore_interval: int = 4
+    multimodal_explore_uncertainty_threshold: float = 0.30
+    multimodal_late_explore_uncertainty_threshold: float = 0.45
+    hypothesis_alignment_weight: float = 0.15
+    gp_verifier_enabled: bool = True
+    gp_verifier_min_score_ratio: float = 0.75
+    gp_verifier_duplicate_distance: float = 1e-4
 
 
 @dataclass
@@ -123,6 +138,11 @@ class HypothesisRecord:
     created_trial: int
     expires_trial: int
     baseline_best: float
+    confidence: float = 0.0
+    region_center: Sequence[float] | None = None
+    region_radius: float | None = None
+    sensitive_dims: Sequence[int] = field(default_factory=tuple)
+    falsification_rule: str | None = None
     status: str = "active"
 
     def to_dict(self) -> dict[str, Any]:
@@ -135,6 +155,11 @@ class HypothesisRecord:
             "created_trial": self.created_trial,
             "expires_trial": self.expires_trial,
             "baseline_best": self.baseline_best,
+            "confidence": self.confidence,
+            "region_center": [float(value) for value in self.region_center] if self.region_center is not None else None,
+            "region_radius": self.region_radius,
+            "sensitive_dims": [int(dim) for dim in self.sensitive_dims],
+            "falsification_rule": self.falsification_rule,
             "status": self.status,
         }
 
@@ -230,7 +255,13 @@ class WMBOState:
             counts[record.status] = counts.get(record.status, 0) + 1
         return counts
 
-    def allowed_strategies(self, phase: str, trial_number: int, uncertainty: float) -> tuple[set[str], list[str]]:
+    def allowed_strategies(
+        self,
+        phase: str,
+        trial_number: int,
+        uncertainty: float,
+        modality_label: str = "unknown",
+    ) -> tuple[set[str], list[str]]:
         """Return strategies currently allowed by budget, trust, and cooldown gates."""
 
         allowed = set(STRATEGIES)
@@ -260,10 +291,18 @@ class WMBOState:
         elif phase == "late":
             allowed.discard("global_diverse")
             reasons.append("late_global_forbidden")
+            multimodal_pressure = (
+                modality_label in {"multimodal", "highly_multimodal"}
+                and uncertainty_value >= self.config.multimodal_late_explore_uncertainty_threshold
+                and self._steps_since_exploration() >= max(1, int(self.config.multimodal_explore_interval))
+            )
             allow_explore = (
-                uncertainty_value >= self.config.late_explore_uncertainty_threshold
-                and self.consecutive_no_improvement >= 2
-                and self.trusts["explore_ucb"] >= self.config.trust_initial
+                (
+                    uncertainty_value >= self.config.late_explore_uncertainty_threshold
+                    and self.consecutive_no_improvement >= 2
+                    and self.trusts["explore_ucb"] >= self.config.trust_initial
+                )
+                or multimodal_pressure
             )
             if not allow_explore:
                 allowed.discard("explore_ucb")
@@ -289,8 +328,19 @@ class WMBOState:
             Tuple ``(executed_strategy, override_reason, allowed_strategies)``.
         """
 
-        allowed, gate_reasons = self.allowed_strategies(phase, trial_number, uncertainty)
+        allowed, gate_reasons = self.allowed_strategies(phase, trial_number, uncertainty, modality_label)
         proposed = str(proposed_strategy).strip().lower().replace("-", "_")
+
+        guard_strategy = self._multimodal_exploration_guard(
+            allowed=allowed,
+            phase=phase,
+            uncertainty=uncertainty,
+            modality_label=modality_label,
+        )
+        if guard_strategy is not None:
+            if proposed in EXPLORATION_STRATEGIES and proposed in allowed:
+                return proposed, None, allowed
+            return guard_strategy, "multimodal_exploration_guard", allowed
 
         if self.follow_up_local:
             strategy = "trust_region" if smoothness_label in {"rugged", "mixed"} or modality_label in {"multimodal", "highly_multimodal"} else "exploit_ei"
@@ -314,6 +364,11 @@ class WMBOState:
         strategy: str,
         trial_number: int,
         baseline_best: float,
+        confidence: float = 0.0,
+        region_center: Sequence[float] | None = None,
+        region_radius: float | None = None,
+        sensitive_dims: Sequence[int] | None = None,
+        falsification_rule: str | None = None,
     ) -> HypothesisRecord | None:
         """Create a hypothesis record and expire older active records for that strategy."""
 
@@ -331,6 +386,11 @@ class WMBOState:
             created_trial=int(trial_number),
             expires_trial=int(trial_number) + max(1, int(self.config.hypothesis_window)) - 1,
             baseline_best=float(baseline_best),
+            confidence=_clamp(confidence, 0.0, 1.0),
+            region_center=_normalise_region_center(region_center),
+            region_radius=_normalise_region_radius(region_radius),
+            sensitive_dims=_normalise_sensitive_dims(sensitive_dims),
+            falsification_rule=_normalise_text(falsification_rule),
         )
         self.hypotheses.append(record)
         return record
@@ -396,6 +456,97 @@ class WMBOState:
                 break
             count += 1
         return count
+
+    def _steps_since_exploration(self) -> int:
+        if not self.executed_strategies:
+            return max(1, int(self.config.multimodal_explore_interval))
+        for offset, strategy in enumerate(reversed(self.executed_strategies), start=1):
+            if strategy in EXPLORATION_STRATEGIES:
+                return offset - 1
+        return len(self.executed_strategies)
+
+    def _multimodal_exploration_guard(
+        self,
+        *,
+        allowed: set[str],
+        phase: str,
+        uncertainty: float,
+        modality_label: str,
+    ) -> str | None:
+        if modality_label not in {"multimodal", "highly_multimodal"}:
+            return None
+        exploratory = [strategy for strategy in ("explore_ucb", "global_diverse") if strategy in allowed]
+        if not exploratory:
+            return None
+        interval = max(1, int(self.config.multimodal_explore_interval))
+        if self._steps_since_exploration() < interval:
+            return None
+        threshold = (
+            self.config.multimodal_late_explore_uncertainty_threshold
+            if phase == "late"
+            else self.config.multimodal_explore_uncertainty_threshold
+        )
+        if float(uncertainty) < float(threshold):
+            return None
+        return exploratory[0]
+
+
+def _clamp(value: object, lower: float, upper: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return float(lower)
+    if not math.isfinite(parsed):
+        return float(lower)
+    return float(min(max(parsed, lower), upper))
+
+
+def _normalise_region_center(value: Sequence[float] | None) -> list[float] | None:
+    if value is None:
+        return None
+    result: list[float] = []
+    for item in value:
+        try:
+            parsed = float(item)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(parsed):
+            return None
+        result.append(float(min(max(parsed, 0.0), 1.0)))
+    return result or None
+
+
+def _normalise_region_radius(value: float | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed) or parsed <= 0.0:
+        return None
+    return float(min(max(parsed, 1e-6), 1.0))
+
+
+def _normalise_sensitive_dims(value: Sequence[int] | None) -> list[int]:
+    if value is None:
+        return []
+    result: list[int] = []
+    for item in value:
+        try:
+            parsed = int(item)
+        except (TypeError, ValueError):
+            continue
+        if parsed >= 0 and parsed not in result:
+            result.append(parsed)
+    return result
+
+
+def _normalise_text(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def build_default_optimizer_config(method: str, budget: int, seed: int) -> OptimizerConfig:

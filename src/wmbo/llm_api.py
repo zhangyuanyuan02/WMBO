@@ -375,8 +375,13 @@ def build_world_model_messages(
         "You are a world-model black-box optimisation agent. "
         "The objective is minimisation under a small evaluation budget. "
         "Choose exactly one strategy from: global_diverse, explore_ucb, exploit_ei, trust_region. "
-        "Return strict JSON only with keys: world_model, strategy, hypothesis, confidence, rationale, selected_candidate_id. "
+        "Return strict JSON only with keys: world_model, strategy, hypothesis, hypothesis_region, confidence, falsification_rule, rationale, selected_candidate_id. "
         "world_model must contain categorical fields: smoothness, modality, curvature, anisotropy. "
+        "hypothesis_region must be an object with center, radius, and sensitive_dims. "
+        "center is a normalised coordinate array in [0,1] or null if unknown. "
+        "radius is a positive normalised scalar or null if unknown. "
+        "sensitive_dims is an array of zero-based integer dimension indexes, or [] when all dimensions matter. "
+        "falsification_rule must state what future evidence would reject or refine the hypothesis. "
         "Allowed smoothness: smooth, mixed, rugged, unknown. "
         "Allowed modality: mostly_unimodal, multimodal, highly_multimodal, unknown. "
         "Allowed curvature/anisotropy: low, moderate, high, unknown. "
@@ -405,6 +410,7 @@ def parse_reasoning_decision(text: str) -> ReasoningDecision:
     if strategy not in allowed:
         raise LLMAPIError(f"Unsupported strategy from LLM: {strategy!r}.")
     confidence = _parse_confidence(data.get("confidence", 0.0))
+    center, radius, sensitive_dims = _parse_hypothesis_region(data)
     return ReasoningDecision(
         world_model=normalise_world_model(data.get("world_model")),
         strategy=strategy,
@@ -412,6 +418,10 @@ def parse_reasoning_decision(text: str) -> ReasoningDecision:
         confidence=float(min(max(confidence, 0.0), 1.0)),
         rationale=str(data.get("rationale", "")).strip(),
         selected_candidate_id=(str(data["selected_candidate_id"]) if data.get("selected_candidate_id") is not None else None),
+        hypothesis_region_center=center,
+        hypothesis_region_radius=radius,
+        hypothesis_sensitive_dims=sensitive_dims,
+        falsification_rule=_optional_text(data.get("falsification_rule")),
         metadata={"source": "llm"},
     )
 
@@ -462,6 +472,79 @@ def _parse_confidence(value: Any) -> float:
     if not math.isfinite(parsed):
         raise LLMAPIError("LLM confidence must be finite.")
     return parsed
+
+
+def _parse_hypothesis_region(data: Mapping[str, Any]) -> tuple[list[float] | None, float | None, list[int]]:
+    raw_region = data.get("hypothesis_region")
+    region = raw_region if isinstance(raw_region, Mapping) else {}
+    center = _parse_optional_float_sequence(region.get("center", data.get("hypothesis_region_center")))
+    radius = _parse_optional_positive_float(region.get("radius", data.get("hypothesis_region_radius")))
+    dims = _parse_optional_int_sequence(region.get("sensitive_dims", data.get("hypothesis_sensitive_dims")))
+    if center is not None:
+        center = [float(min(max(value, 0.0), 1.0)) for value in center]
+    if radius is not None:
+        radius = float(min(max(radius, 1e-6), 1.0))
+    return center, radius, dims
+
+
+def _parse_optional_float_sequence(value: Any) -> list[float] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise LLMAPIError("hypothesis_region.center must be an array or null.")
+    result: list[float] = []
+    for item in value:
+        if isinstance(item, bool):
+            raise LLMAPIError("hypothesis_region.center values must be numeric.")
+        try:
+            parsed = float(item)
+        except (TypeError, ValueError) as exc:
+            raise LLMAPIError("hypothesis_region.center values must be numeric.") from exc
+        if not math.isfinite(parsed):
+            raise LLMAPIError("hypothesis_region.center values must be finite.")
+        result.append(parsed)
+    return result
+
+
+def _parse_optional_positive_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise LLMAPIError("hypothesis_region.radius must be numeric.")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise LLMAPIError("hypothesis_region.radius must be numeric.") from exc
+    if not math.isfinite(parsed) or parsed <= 0.0:
+        raise LLMAPIError("hypothesis_region.radius must be a positive finite number.")
+    return parsed
+
+
+def _parse_optional_int_sequence(value: Any) -> list[int]:
+    if value is None:
+        return []
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise LLMAPIError("hypothesis_region.sensitive_dims must be an array.")
+    result: list[int] = []
+    for item in value:
+        if isinstance(item, bool):
+            raise LLMAPIError("hypothesis_region.sensitive_dims values must be integers.")
+        try:
+            parsed = int(item)
+        except (TypeError, ValueError) as exc:
+            raise LLMAPIError("hypothesis_region.sensitive_dims values must be integers.") from exc
+        if parsed < 0:
+            raise LLMAPIError("hypothesis_region.sensitive_dims values must be non-negative.")
+        if parsed not in result:
+            result.append(parsed)
+    return result
+
+
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def normalise_world_model(value: Any) -> dict[str, str]:

@@ -381,6 +381,8 @@ class WMBOOptimizer:
             n_pool=max(1, self.config.candidate_pool_size),
             n_options_per_strategy=max(1, int(self._control.config.candidate_options_per_strategy)),
             seed=self.config.seed + 25_000 + state.step,
+            active_hypotheses=self._control.hypothesis_summary(),
+            hypothesis_alignment_weight=float(self._control.config.hypothesis_alignment_weight),
         )
         decision, agent_type, llm_error = self._decide(
             state=state,
@@ -399,24 +401,47 @@ class WMBOOptimizer:
             smoothness_label=labels.get("smoothness", "unknown"),
             modality_label=labels.get("modality", "unknown"),
         )
-        hypothesis_record = self._control.create_hypothesis(
-            text=decision.hypothesis,
-            strategy=executed_strategy,
-            trial_number=state.step + 1,
-            baseline_best=float(np.min(observed_y)),
-        )
 
         selected_option, candidate_override = _select_strategy_candidate(
             candidate_options,
             strategy=executed_strategy,
             requested_candidate_id=decision.selected_candidate_id,
         )
+        selected_option, gp_verifier_metadata, gp_verifier_override = _verify_candidate_with_gp(
+            candidates=candidate_options,
+            selected=selected_option,
+            strategy=executed_strategy,
+            decision_confidence=float(decision.confidence),
+            config=self._control.config,
+        )
+        candidate_override = _append_override(candidate_override, gp_verifier_override)
         candidate = list(selected_option["x_unit"])
         validator = CandidateValidator(dim=state.benchmark.dim)
         is_valid, _issues = validator.validate(candidate)
         if not is_valid:
             candidate = validator.repair(candidate)
             candidate_override = "candidate_repaired" if candidate_override is None else f"{candidate_override};candidate_repaired"
+
+        structured_hypothesis = _structured_hypothesis(
+            decision=decision,
+            candidate=candidate,
+            dim=state.benchmark.dim,
+            strategy=executed_strategy,
+            phase=phase,
+            trial_number=state.step + 1,
+            hypothesis_window=int(self._control.config.hypothesis_window),
+        )
+        hypothesis_record = self._control.create_hypothesis(
+            text=decision.hypothesis,
+            strategy=executed_strategy,
+            trial_number=state.step + 1,
+            baseline_best=float(np.min(observed_y)),
+            confidence=structured_hypothesis["confidence"],
+            region_center=structured_hypothesis["region_center"],
+            region_radius=structured_hypothesis["region_radius"],
+            sensitive_dims=structured_hypothesis["sensitive_dims"],
+            falsification_rule=structured_hypothesis["falsification_rule"],
+        )
 
         self._pending_trial = {
             "strategy": executed_strategy,
@@ -435,20 +460,31 @@ class WMBOOptimizer:
             "strategy_success_rates": self._control.recent_success_rates(),
             "hypothesis_id": hypothesis_record.hypothesis_id if hypothesis_record else None,
             "hypothesis_status": hypothesis_record.status if hypothesis_record else None,
+            "hypothesis_region_center": hypothesis_record.region_center if hypothesis_record else None,
+            "hypothesis_region_radius": hypothesis_record.region_radius if hypothesis_record else None,
+            "hypothesis_sensitive_dims": hypothesis_record.sensitive_dims if hypothesis_record else None,
+            "hypothesis_confidence": hypothesis_record.confidence if hypothesis_record else None,
+            "falsification_rule": hypothesis_record.falsification_rule if hypothesis_record else None,
             "hypothesis_status_counts": self._control.hypothesis_status_counts(),
             "agent_type": agent_type,
             "llm_error": llm_error,
             "candidate_options": candidate_options,
+            "requested_candidate_id": decision.selected_candidate_id,
+            "selected_candidate_id": selected_option.get("candidate_id"),
             "candidate_override": candidate_override,
+            "gp_verifier": gp_verifier_metadata,
             "wmbo_control": self._control.to_dict(),
         }
         self._last_acquisition = {
             "score": selected_option.get("acquisition_score"),
+            "selection_score": selected_option.get("selection_score"),
             "selected_candidate_id": selected_option.get("candidate_id"),
             "strategy": executed_strategy,
             "acquisition_strategy": selected_option.get("acquisition_strategy"),
             "surrogate_mean": selected_option.get("surrogate_mean"),
             "surrogate_std": selected_option.get("surrogate_std"),
+            "hypothesis_alignment": selected_option.get("hypothesis_alignment"),
+            "gp_verifier": gp_verifier_metadata,
             "descriptor": descriptor.to_dict(),
         }
         return candidate
@@ -510,6 +546,10 @@ class WMBOOptimizer:
                 rationale=fallback.rationale,
                 world_model=fallback.world_model,
                 selected_candidate_id=fallback.selected_candidate_id,
+                hypothesis_region_center=fallback.hypothesis_region_center,
+                hypothesis_region_radius=fallback.hypothesis_region_radius,
+                hypothesis_sensitive_dims=fallback.hypothesis_sensitive_dims,
+                falsification_rule=fallback.falsification_rule,
                 metadata=fallback_metadata,
             )
             return fallback_decision, "rule_fallback", str(exc)
@@ -747,6 +787,8 @@ def _build_strategy_candidate_options(
     n_pool: int,
     n_options_per_strategy: int,
     seed: int,
+    active_hypotheses: Sequence[Mapping[str, object]] | None = None,
+    hypothesis_alignment_weight: float = 0.0,
 ) -> list[dict[str, object]]:
     """Build scored candidate options grouped by WMBO strategy."""
 
@@ -777,13 +819,22 @@ def _build_strategy_candidate_options(
             )
             x = [float(value) for value in acquisition.selected_x]
             selected_index = int(acquisition.selected_index)
+            score = float(acquisition.score)
+            alignment = _hypothesis_alignment(x, active_hypotheses or [])
+            selection_score = _adjust_score_for_hypothesis(
+                score=score,
+                alignment=alignment,
+                weight=float(hypothesis_alignment_weight),
+            )
             options.append(
                 {
                     "candidate_id": f"{strategy}_{option_index + 1}",
                     "strategy": strategy,
                     "x_unit": x,
                     "acquisition_strategy": acquisition_strategy,
-                    "acquisition_score": float(acquisition.score),
+                    "acquisition_score": score,
+                    "selection_score": selection_score,
+                    "hypothesis_alignment": alignment,
                     "surrogate_mean": float(prediction.mean[selected_index]),
                     "surrogate_std": float(prediction.std[selected_index]),
                     "distance_to_best": float(np.linalg.norm(np.asarray(x, dtype=float) - best)),
@@ -815,8 +866,246 @@ def _select_strategy_candidate(
     else:
         reason = "candidate_id_missing"
 
-    selected = max(matching, key=lambda candidate: float(candidate.get("acquisition_score", float("-inf"))))
+    selected = max(matching, key=_candidate_selection_score)
     return selected, reason
+
+
+def _candidate_selection_score(candidate: Mapping[str, object]) -> float:
+    score = candidate.get("selection_score", candidate.get("acquisition_score", float("-inf")))
+    try:
+        value = float(score)
+    except (TypeError, ValueError):
+        return float("-inf")
+    return value if math.isfinite(value) else float("-inf")
+
+
+def _hypothesis_alignment(candidate: Sequence[float], hypotheses: Sequence[Mapping[str, object]]) -> float:
+    x = np.asarray(candidate, dtype=float)
+    best_alignment = 0.0
+    for hypothesis in hypotheses:
+        if str(hypothesis.get("status", "active")) != "active":
+            continue
+        center_value = hypothesis.get("region_center")
+        radius_value = hypothesis.get("region_radius")
+        if center_value is None or radius_value is None:
+            continue
+        try:
+            center = np.asarray(center_value, dtype=float)
+            radius = float(radius_value)
+            confidence = float(hypothesis.get("confidence", 1.0))
+        except (TypeError, ValueError):
+            continue
+        if center.shape != x.shape or not math.isfinite(radius) or radius <= 0.0:
+            continue
+        dims = _valid_sensitive_dims(hypothesis.get("sensitive_dims"), dim=len(x))
+        diff = x[dims] - center[dims] if dims else x - center
+        distance = float(np.linalg.norm(diff))
+        alignment = max(0.0, 1.0 - distance / radius) * max(0.0, min(confidence, 1.0))
+        best_alignment = max(best_alignment, alignment)
+    return float(min(best_alignment, 1.0))
+
+
+def _adjust_score_for_hypothesis(*, score: float, alignment: float, weight: float) -> float:
+    if not math.isfinite(float(score)):
+        return float("-inf")
+    bounded_alignment = max(0.0, min(float(alignment), 1.0))
+    bounded_weight = max(0.0, float(weight))
+    if bounded_alignment <= 0.0 or bounded_weight <= 0.0:
+        return float(score)
+    if score >= 0.0:
+        return float(score * (1.0 + bounded_weight * bounded_alignment))
+    return float(score * (1.0 - min(0.95, bounded_weight * bounded_alignment)))
+
+
+def _verify_candidate_with_gp(
+    *,
+    candidates: Sequence[Mapping[str, object]],
+    selected: Mapping[str, object],
+    strategy: str,
+    decision_confidence: float,
+    config: WMBOControlConfig,
+) -> tuple[Mapping[str, object], dict[str, object], str | None]:
+    """Accept or refine a selected option using same-strategy GP diagnostics."""
+
+    selected_id = str(selected.get("candidate_id"))
+    matching = [candidate for candidate in candidates if str(candidate.get("strategy")) == strategy]
+    enabled = _truthy(config.gp_verifier_enabled)
+    metadata: dict[str, object] = {
+        "enabled": enabled,
+        "action": "accepted",
+        "reason": None,
+        "original_candidate_id": selected_id,
+        "verified_candidate_id": selected_id,
+        "decision_confidence": float(decision_confidence),
+        "original_acquisition_score": _candidate_acquisition_score(selected),
+        "original_surrogate_std": _candidate_float(selected, "surrogate_std"),
+    }
+    if not enabled or len(matching) <= 1:
+        return selected, metadata, None
+
+    best_by_acquisition = max(matching, key=_candidate_acquisition_score)
+    best_score = _candidate_acquisition_score(best_by_acquisition)
+    selected_score = _candidate_acquisition_score(selected)
+    min_ratio = max(0.0, min(float(config.gp_verifier_min_score_ratio), 1.0))
+    confidence = max(0.0, min(float(decision_confidence), 1.0))
+
+    refined = selected
+    reason: str | None = None
+    if confidence < 0.85 and _score_is_much_worse(selected_score, best_score, min_ratio):
+        refined = best_by_acquisition
+        reason = "gp_refined_low_acquisition_score"
+    elif _candidate_float(selected, "distance_to_nearest_observation") < float(config.gp_verifier_duplicate_distance):
+        less_duplicate = max(
+            matching,
+            key=lambda candidate: (
+                _candidate_float(candidate, "distance_to_nearest_observation"),
+                _candidate_acquisition_score(candidate),
+            ),
+        )
+        if less_duplicate is not selected:
+            refined = less_duplicate
+            reason = "gp_refined_duplicate_candidate"
+    elif strategy in {"explore_ucb", "global_diverse"} and confidence < 0.80:
+        std_values = [_candidate_float(candidate, "surrogate_std") for candidate in matching]
+        median_std = float(np.median(std_values)) if std_values else 0.0
+        selected_std = _candidate_float(selected, "surrogate_std")
+        if median_std > 0.0 and selected_std < 0.75 * median_std:
+            refined = max(
+                matching,
+                key=lambda candidate: (
+                    _candidate_float(candidate, "surrogate_std"),
+                    _candidate_float(candidate, "distance_to_nearest_observation"),
+                    _candidate_acquisition_score(candidate),
+                ),
+            )
+            reason = "gp_refined_low_exploration_uncertainty"
+
+    metadata.update(
+        {
+            "best_candidate_id": str(best_by_acquisition.get("candidate_id")),
+            "best_acquisition_score": best_score,
+            "verified_candidate_id": str(refined.get("candidate_id")),
+            "verified_acquisition_score": _candidate_acquisition_score(refined),
+            "verified_surrogate_std": _candidate_float(refined, "surrogate_std"),
+        }
+    )
+    if reason is None or refined is selected:
+        return selected, metadata, None
+
+    metadata["action"] = "refined"
+    metadata["reason"] = reason
+    return refined, metadata, reason
+
+
+def _score_is_much_worse(selected_score: float, best_score: float, min_ratio: float) -> bool:
+    if not math.isfinite(selected_score) or not math.isfinite(best_score):
+        return False
+    if best_score > 0.0:
+        return selected_score < best_score * min_ratio
+    if best_score < 0.0:
+        tolerated_gap = abs(best_score) * (1.0 - min_ratio)
+        return selected_score < best_score - tolerated_gap
+    return selected_score < -1e-12
+
+
+def _candidate_acquisition_score(candidate: Mapping[str, object]) -> float:
+    return _candidate_float(candidate, "acquisition_score", default=float("-inf"))
+
+
+def _candidate_float(candidate: Mapping[str, object], key: str, default: float = 0.0) -> float:
+    try:
+        value = float(candidate.get(key, default))
+    except (TypeError, ValueError):
+        return float(default)
+    return value if math.isfinite(value) else float(default)
+
+
+def _append_override(current: str | None, extra: str | None) -> str | None:
+    if not extra:
+        return current
+    return extra if not current else f"{current};{extra}"
+
+
+def _structured_hypothesis(
+    *,
+    decision: Any,
+    candidate: Sequence[float],
+    dim: int,
+    strategy: str,
+    phase: str,
+    trial_number: int,
+    hypothesis_window: int,
+) -> dict[str, object]:
+    candidate_center = [float(min(max(value, 0.0), 1.0)) for value in candidate]
+    center = _valid_region_center(getattr(decision, "hypothesis_region_center", None), dim=dim) or candidate_center
+    radius = _valid_region_radius(getattr(decision, "hypothesis_region_radius", None))
+    if radius is None:
+        radius = _default_hypothesis_radius(strategy=strategy, phase=phase)
+    dims = _valid_sensitive_dims(getattr(decision, "hypothesis_sensitive_dims", None), dim=dim)
+    falsification_rule = getattr(decision, "falsification_rule", None)
+    if not falsification_rule:
+        expires_trial = int(trial_number) + max(1, int(hypothesis_window)) - 1
+        falsification_rule = f"Refine or reject if no best-value improvement by trial {expires_trial}."
+    return {
+        "region_center": center,
+        "region_radius": radius,
+        "sensitive_dims": dims,
+        "confidence": float(max(0.0, min(float(getattr(decision, "confidence", 0.0)), 1.0))),
+        "falsification_rule": str(falsification_rule).strip(),
+    }
+
+
+def _valid_region_center(value: object, *, dim: int) -> list[float] | None:
+    if value is None or isinstance(value, (str, bytes, bytearray)):
+        return None
+    try:
+        center = [float(item) for item in value]  # type: ignore[iteration-over-optional]
+    except (TypeError, ValueError):
+        return None
+    if len(center) != dim or not all(math.isfinite(item) for item in center):
+        return None
+    return [float(min(max(item, 0.0), 1.0)) for item in center]
+
+
+def _valid_region_radius(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        radius = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(radius) or radius <= 0.0:
+        return None
+    return float(min(max(radius, 0.02), 0.75))
+
+
+def _valid_sensitive_dims(value: object, *, dim: int) -> list[int]:
+    if value is None or isinstance(value, (str, bytes, bytearray)):
+        return list(range(dim))
+    result: list[int] = []
+    try:
+        iterator = iter(value)  # type: ignore[arg-type]
+    except TypeError:
+        return list(range(dim))
+    for item in iterator:
+        try:
+            parsed = int(item)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= parsed < dim and parsed not in result:
+            result.append(parsed)
+    return result or list(range(dim))
+
+
+def _default_hypothesis_radius(*, strategy: str, phase: str) -> float:
+    key = strategy.strip().lower().replace("-", "_")
+    if key == "trust_region":
+        return 0.12 if phase != "early" else 0.18
+    if key == "exploit_ei":
+        return 0.16 if phase != "early" else 0.22
+    if key == "explore_ucb":
+        return 0.28
+    return 0.35
 
 
 def _distance_to_nearest_observation(candidate: Sequence[float], observed_x: np.ndarray) -> float:

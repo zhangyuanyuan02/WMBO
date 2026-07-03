@@ -42,6 +42,13 @@ class ReasoningDecision:
         hypothesis: Agent's current explanation of the search landscape.
         confidence: Confidence score in the range ``[0, 1]``.
         rationale: Short text explaining the decision.
+        hypothesis_region_center: Optional centre of the hypothesis region in
+            normalised coordinates.
+        hypothesis_region_radius: Optional normalised radius of the hypothesis
+            region.
+        hypothesis_sensitive_dims: Dimensions most relevant to the hypothesis.
+        falsification_rule: Short rule describing when the hypothesis should be
+            treated as unsupported.
         metadata: Optional structured reasoning details.
 
     Output:
@@ -54,6 +61,10 @@ class ReasoningDecision:
     rationale: str
     world_model: Mapping[str, str] = field(default_factory=dict)
     selected_candidate_id: str | None = None
+    hypothesis_region_center: Sequence[float] | None = None
+    hypothesis_region_radius: float | None = None
+    hypothesis_sensitive_dims: Sequence[int] = field(default_factory=tuple)
+    falsification_rule: str | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
@@ -66,6 +77,18 @@ class ReasoningDecision:
             "rationale": self.rationale,
             "world_model": dict(self.world_model),
             "selected_candidate_id": self.selected_candidate_id,
+            "hypothesis_region_center": (
+                [float(value) for value in self.hypothesis_region_center]
+                if self.hypothesis_region_center is not None
+                else None
+            ),
+            "hypothesis_region_radius": (
+                float(self.hypothesis_region_radius)
+                if self.hypothesis_region_radius is not None
+                else None
+            ),
+            "hypothesis_sensitive_dims": [int(dim) for dim in self.hypothesis_sensitive_dims],
+            "falsification_rule": self.falsification_rule,
             "metadata": dict(self.metadata),
         }
 

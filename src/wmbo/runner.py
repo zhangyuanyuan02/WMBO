@@ -298,13 +298,22 @@ def _write_observations_csv(path: Path, observations: Sequence[Mapping[str, obje
         "consecutive_no_improvement",
         "hypothesis_id",
         "hypothesis_status",
+        "hypothesis_region_center",
+        "hypothesis_region_radius",
+        "hypothesis_sensitive_dims",
+        "hypothesis_confidence",
+        "falsification_rule",
         "hypothesis_status_counts",
         "strategy_trust",
         "strategy_success_rates",
         "agent_type",
         "llm_error",
+        "requested_candidate_id",
         "selected_candidate_id",
         "candidate_override",
+        "gp_verifier_action",
+        "gp_verifier_reason",
+        "verified_candidate_id",
     ]
     with path.open("w", encoding="utf-8", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=fieldnames)
@@ -313,6 +322,8 @@ def _write_observations_csv(path: Path, observations: Sequence[Mapping[str, obje
             row = dict(observation)
             row["x_unit"] = _format_vector(row.get("x_unit"))
             row["x_raw"] = _format_vector(row.get("x_raw"))
+            row["hypothesis_region_center"] = _format_vector(row.get("hypothesis_region_center"))
+            row["hypothesis_sensitive_dims"] = _format_vector(row.get("hypothesis_sensitive_dims"))
             for key in ("strategy_trust", "strategy_success_rates", "hypothesis_status_counts"):
                 row[key] = _format_mapping(row.get(key))
             writer.writerow({name: row.get(name) for name in fieldnames})
@@ -335,6 +346,8 @@ def _extract_observation_metadata(state_metadata: Mapping[str, object]) -> dict[
         return {}
     control = decision.get("wmbo_control")
     control_map = control if isinstance(control, Mapping) else {}
+    verifier = decision.get("gp_verifier")
+    verifier_map = verifier if isinstance(verifier, Mapping) else {}
     return {
         "strategy": decision.get("executed_strategy", decision.get("strategy")),
         "proposed_strategy": decision.get("proposed_strategy"),
@@ -345,16 +358,27 @@ def _extract_observation_metadata(state_metadata: Mapping[str, object]) -> dict[
         "consecutive_no_improvement": control_map.get("consecutive_no_improvement"),
         "hypothesis_id": decision.get("hypothesis_id"),
         "hypothesis_status": decision.get("hypothesis_status"),
+        "hypothesis_region_center": decision.get("hypothesis_region_center"),
+        "hypothesis_region_radius": decision.get("hypothesis_region_radius"),
+        "hypothesis_sensitive_dims": decision.get("hypothesis_sensitive_dims"),
+        "hypothesis_confidence": decision.get("hypothesis_confidence"),
+        "falsification_rule": decision.get("falsification_rule"),
         "hypothesis_status_counts": decision.get("hypothesis_status_counts"),
         "strategy_trust": decision.get("strategy_trust"),
         "strategy_success_rates": decision.get("strategy_success_rates"),
         "agent_type": decision.get("agent_type"),
         "llm_error": decision.get("llm_error"),
+        "requested_candidate_id": decision.get("requested_candidate_id"),
         "selected_candidate_id": decision.get("selected_candidate_id"),
         "candidate_override": decision.get("candidate_override"),
+        "gp_verifier_action": verifier_map.get("action"),
+        "gp_verifier_reason": verifier_map.get("reason"),
+        "verified_candidate_id": verifier_map.get("verified_candidate_id"),
     }
 
 def _format_vector(value: object) -> str:
+    if value is None:
+        return ""
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
         return "[" + ", ".join(f"{float(item):.8g}" for item in value) + "]"
     return str(value)
