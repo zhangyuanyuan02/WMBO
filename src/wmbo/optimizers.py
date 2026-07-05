@@ -198,7 +198,7 @@ class BayesianOptimizationOptimizer:
 
         self.config = config
         self.acquisition_strategy = acquisition_strategy
-        self._initial = SobolSearchOptimizer(config)
+        self._initial = RandomSearchOptimizer(config)
 
     def ask(self, state: OptimizerState) -> Vector:
         """Propose a candidate using initial design or surrogate-guided search.
@@ -262,7 +262,7 @@ class EvolutionStrategyOptimizer:
         """
 
         self.config = config
-        self._initial = SobolSearchOptimizer(config)
+        self._initial = RandomSearchOptimizer(config)
         self._rng = np.random.default_rng(config.seed)
 
     def ask(self, state: OptimizerState) -> Vector:
@@ -313,7 +313,7 @@ class WMBOOptimizer:
         """
 
         self.config = config
-        self._initial = SobolSearchOptimizer(config)
+        self._initial = RandomSearchOptimizer(config)
         self._agent = WorldModelAgent()
         self._control = WMBOState(_wmbo_control_config_from_options(self.config.options))
         self._llm_client: OpenAIStyleClient | None = None
@@ -339,12 +339,12 @@ class WMBOOptimizer:
             self._last_decision = {
                 "strategy": "initial_design",
                 "executed_strategy": "initial_design",
-                "rationale": "Collecting initial Sobol design points before fitting a world model.",
+                "rationale": "Collecting initial random design points before fitting a world model.",
                 "budget_phase": phase,
                 "remaining_budget": self._control.remaining_budget(state.step, self.config.budget),
                 "wmbo_control": self._control.to_dict(),
             }
-            self._last_acquisition = {"strategy": "sobol"}
+            self._last_acquisition = {"strategy": "random"}
             return candidate
 
         observed_x, observed_y = observations_to_arrays(state.observations, dim=state.benchmark.dim)
