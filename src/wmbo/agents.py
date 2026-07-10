@@ -188,7 +188,11 @@ class WorldModelAgent:
 
         smoothness = labels.get("smoothness", "unknown")
         modality = labels.get("modality", "unknown")
+        curvature = labels.get("curvature", "unknown")
+        anisotropy = labels.get("anisotropy", "unknown")
         uncertainty = labels.get("uncertainty", "unknown")
+        coverage = labels.get("coverage", "unknown")
+        progress = labels.get("progress", "unknown")
         sample_size = labels.get("sample_size", "small")
 
         if n_obs < max(5, 2 * max(1, dim)):
@@ -196,11 +200,21 @@ class WorldModelAgent:
             confidence = 0.45
             hypothesis = "The objective is still under-observed, so diverse global samples should improve the world model."
             rationale = "Observation count is low relative to dimensionality."
+        elif progress == "stalled" and uncertainty == "high" and coverage in {"low", "moderate"} and remaining_ratio > 0.20:
+            strategy = "global_diverse"
+            confidence = 0.72
+            hypothesis = "The search has stopped improving while the observed domain coverage is still incomplete."
+            rationale = "A broader sample can test whether the current world model is over-focused on one region."
         elif modality in {"highly_multimodal", "multimodal"} and recent_improvement <= 1e-8:
             strategy = "global_diverse"
             confidence = 0.68
             hypothesis = "The search may be trapped in one basin of a multimodal landscape."
             rationale = "Progress has stalled while the descriptor suggests multiple local basins."
+        elif curvature == "high" and uncertainty != "low" and remaining_ratio > 0.25:
+            strategy = "explore_ucb"
+            confidence = 0.66
+            hypothesis = "The response appears nonlinear enough that the surrogate should reduce uncertainty before local refinement."
+            rationale = "High curvature with non-low uncertainty favours uncertainty-aware exploration."
         elif uncertainty == "high" and remaining_ratio > 0.25:
             strategy = "explore_ucb"
             confidence = 0.62
@@ -211,6 +225,11 @@ class WorldModelAgent:
             confidence = 0.60
             hypothesis = "A rugged landscape makes purely local refinement risky."
             rationale = "Global diversity is preferred while budget remains."
+        elif anisotropy == "high" and sample_size == "usable":
+            strategy = "trust_region"
+            confidence = 0.67
+            hypothesis = "Only a subset of dimensions appears to dominate the response, so local refinement can focus the search."
+            rationale = "High anisotropy gives the world model a plausible sensitive subspace."
         elif sample_size == "usable" and remaining_ratio <= 0.35:
             strategy = "exploit_ei"
             confidence = 0.70
@@ -227,6 +246,8 @@ class WorldModelAgent:
             "modality": str(labels.get("modality", "unknown")),
             "curvature": str(labels.get("curvature", "unknown")),
             "anisotropy": str(labels.get("anisotropy", "unknown")),
+            "coverage": str(labels.get("coverage", "unknown")),
+            "progress": str(labels.get("progress", "unknown")),
         }
 
         return ReasoningDecision(
