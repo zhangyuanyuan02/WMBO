@@ -18,6 +18,12 @@ optimizer:
     trust_window: 5
     failure_cooldown_trials: 2
     hypothesis_window: 3
+    information_gain_weight: 0.35
+    hypothesis_support_probability: 0.80
+    hypothesis_rejection_probability: 0.20
+    hypothesis_support_likelihood_ratio: 3.0
+    hypothesis_failure_likelihood_ratio: 0.50
+    hypothesis_min_relevant_evidence: 1
 
 llm:
   enabled: true

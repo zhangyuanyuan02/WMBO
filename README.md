@@ -87,12 +87,31 @@ optimizer:
   wmbo_control:
     early_fraction: 0.35
     late_fraction: 0.70
+    candidate_options_per_strategy: 3
     trust_window: 5
     failure_cooldown_trials: 2
     hypothesis_window: 3
+    information_gain_weight: 0.35
+    hypothesis_support_probability: 0.80
+    hypothesis_rejection_probability: 0.20
+    hypothesis_support_likelihood_ratio: 3.0
+    hypothesis_failure_likelihood_ratio: 0.50
 ```
 
 The control state is still applied after an LLM decision, so the LLM proposes a strategy but does not directly control the optimiser.
+
+The P0 reasoning path now keeps both human-readable labels and calibrated
+categorical posteriors for smoothness, modality, curvature, and anisotropy.
+Each descriptor also records credible intervals, posterior confidence, and
+world-model entropy.
+
+After the initial design, each WMBO strategy exposes optimisation,
+confirmation, and falsification candidates. Candidate ranking combines
+expected improvement with approximate information gain. Hypotheses are updated
+with likelihood ratios only when an evaluation lies in the stated region or was
+explicitly targeted as a confirmation/falsification test. Hypotheses that reach
+their deadline without decisive relevant evidence become `inconclusive` rather
+than being rejected automatically.
 
 ## Optional LLM backend
 

@@ -10,7 +10,7 @@ from typing import Any, Mapping, Protocol, Sequence
 import numpy as np
 from scipy.stats import qmc
 
-from .acquisition import AcquisitionInput, select_next_candidate
+from .acquisition import AcquisitionInput, expected_improvement, score_candidates, select_next_candidate
 from .agents import AgentState, CandidateValidator, WorldModelAgent
 from .benchmarks import BenchmarkSpec, EvaluationResult, sample_unit_points
 from .control import STRATEGIES, OptimizerConfig, WMBOControlConfig, WMBOState
@@ -381,8 +381,11 @@ class WMBOOptimizer:
             n_pool=max(1, self.config.candidate_pool_size),
             n_options_per_strategy=max(1, int(self._control.config.candidate_options_per_strategy)),
             seed=self.config.seed + 25_000 + state.step,
+            phase=phase,
             active_hypotheses=self._control.hypothesis_summary(),
             hypothesis_alignment_weight=float(self._control.config.hypothesis_alignment_weight),
+            information_gain_weight=float(self._control.config.information_gain_weight),
+            world_model_entropy=float(descriptor.calibration.get("world_model_entropy", 1.0)),
         )
         decision, agent_type, llm_error = self._decide(
             state=state,
@@ -447,6 +450,11 @@ class WMBOOptimizer:
             "strategy": executed_strategy,
             "trial_number": state.step + 1,
             "hypothesis_id": hypothesis_record.hypothesis_id if hypothesis_record else None,
+            "candidate": list(candidate),
+            "predicted_mean": selected_option.get("surrogate_mean"),
+            "predicted_std": selected_option.get("surrogate_std"),
+            "evidence_role": selected_option.get("evidence_role"),
+            "target_hypothesis_id": selected_option.get("target_hypothesis_id"),
         }
         self._last_decision = {
             **decision.to_dict(),
@@ -464,6 +472,8 @@ class WMBOOptimizer:
             "hypothesis_region_radius": hypothesis_record.region_radius if hypothesis_record else None,
             "hypothesis_sensitive_dims": hypothesis_record.sensitive_dims if hypothesis_record else None,
             "hypothesis_confidence": hypothesis_record.confidence if hypothesis_record else None,
+            "hypothesis_posterior_probability": hypothesis_record.posterior_probability if hypothesis_record else None,
+            "hypothesis_relevant_evidence_count": hypothesis_record.relevant_evidence_count if hypothesis_record else 0,
             "falsification_rule": hypothesis_record.falsification_rule if hypothesis_record else None,
             "hypothesis_status_counts": self._control.hypothesis_status_counts(),
             "agent_type": agent_type,
@@ -471,6 +481,11 @@ class WMBOOptimizer:
             "candidate_options": candidate_options,
             "requested_candidate_id": decision.selected_candidate_id,
             "selected_candidate_id": selected_option.get("candidate_id"),
+            "evidence_role": selected_option.get("evidence_role"),
+            "target_hypothesis_id": selected_option.get("target_hypothesis_id"),
+            "joint_score": selected_option.get("joint_score"),
+            "expected_improvement": selected_option.get("expected_improvement"),
+            "information_gain": selected_option.get("information_gain"),
             "candidate_override": candidate_override,
             "gp_verifier": gp_verifier_metadata,
             "wmbo_control": self._control.to_dict(),
@@ -478,9 +493,17 @@ class WMBOOptimizer:
         self._last_acquisition = {
             "score": selected_option.get("acquisition_score"),
             "selection_score": selected_option.get("selection_score"),
+            "joint_score": selected_option.get("joint_score"),
+            "expected_improvement": selected_option.get("expected_improvement"),
+            "optimisation_utility": selected_option.get("optimisation_utility"),
+            "information_gain": selected_option.get("information_gain"),
+            "confirmation_value": selected_option.get("confirmation_value"),
+            "falsification_value": selected_option.get("falsification_value"),
             "selected_candidate_id": selected_option.get("candidate_id"),
             "strategy": executed_strategy,
             "acquisition_strategy": selected_option.get("acquisition_strategy"),
+            "evidence_role": selected_option.get("evidence_role"),
+            "target_hypothesis_id": selected_option.get("target_hypothesis_id"),
             "surrogate_mean": selected_option.get("surrogate_mean"),
             "surrogate_std": selected_option.get("surrogate_std"),
             "hypothesis_alignment": selected_option.get("hypothesis_alignment"),
@@ -580,6 +603,15 @@ class WMBOOptimizer:
                 improved=improved,
                 y=float(result.y),
                 best_y=best_y,
+                candidate=self._pending_trial.get("candidate"),
+                predicted_mean=self._pending_trial.get("predicted_mean"),
+                predicted_std=self._pending_trial.get("predicted_std"),
+                evidence_role=str(self._pending_trial.get("evidence_role") or "optimize"),
+                target_hypothesis_id=(
+                    str(self._pending_trial["target_hypothesis_id"])
+                    if self._pending_trial.get("target_hypothesis_id") is not None
+                    else None
+                ),
             )
             outcome_metadata = outcome.to_dict()
 
@@ -593,7 +625,15 @@ class WMBOOptimizer:
                         (record for record in self._control.hypotheses if record.hypothesis_id == hypothesis_id),
                         None,
                     )
-                    decision_metadata["hypothesis_status"] = record.status if record else None
+                    if record is not None:
+                        decision_metadata["hypothesis_status"] = record.status
+                        decision_metadata["hypothesis_posterior_probability"] = record.posterior_probability
+                        decision_metadata["hypothesis_relevant_evidence_count"] = record.relevant_evidence_count
+                        decision_metadata["hypothesis_supporting_evidence"] = record.supporting_evidence
+                        decision_metadata["hypothesis_contradicting_evidence"] = record.contradicting_evidence
+                        decision_metadata["hypothesis_last_evidence"] = record.last_evidence
+                    else:
+                        decision_metadata["hypothesis_status"] = None
             decision_metadata["strategy_trust"] = dict(self._control.trusts)
             decision_metadata["strategy_success_rates"] = self._control.recent_success_rates()
             decision_metadata["hypothesis_status_counts"] = self._control.hypothesis_status_counts()
@@ -787,17 +827,29 @@ def _build_strategy_candidate_options(
     n_pool: int,
     n_options_per_strategy: int,
     seed: int,
+    phase: str = "middle",
     active_hypotheses: Sequence[Mapping[str, object]] | None = None,
     hypothesis_alignment_weight: float = 0.0,
+    information_gain_weight: float = 0.35,
+    world_model_entropy: float = 1.0,
 ) -> list[dict[str, object]]:
     """Build scored candidate options grouped by WMBO strategy."""
 
     best = observed_x[int(np.argmin(observed_y))] if len(observed_y) else np.full(dim, 0.5)
+    hypotheses = [
+        hypothesis
+        for hypothesis in (active_hypotheses or [])
+        if str(hypothesis.get("status", "active")) == "active"
+    ]
+    phase_multiplier = {"early": 1.0, "middle": 0.80, "late": 0.35}.get(str(phase), 0.80)
+    information_weight = float(np.clip(float(information_gain_weight) * phase_multiplier, 0.0, 0.85))
+    roles = ("optimize", "confirm", "falsify") if hypotheses else ("optimize",)
     options: list[dict[str, object]] = []
     for strategy_index, strategy in enumerate(STRATEGIES):
         acquisition_strategy = _strategy_to_acquisition(strategy)
         for option_index in range(max(1, n_options_per_strategy)):
             option_seed = int(seed) + strategy_index * 10_000 + option_index
+            evidence_role = roles[option_index % len(roles)]
             pool = _make_wmbo_candidate_pool(
                 strategy=strategy,
                 observed_x=observed_x,
@@ -806,26 +858,70 @@ def _build_strategy_candidate_options(
                 n_points=n_pool,
                 seed=option_seed,
             )
+            pool = _augment_pool_with_hypothesis_tests(
+                pool,
+                hypotheses=hypotheses,
+                dim=dim,
+                n_points=n_pool,
+                seed=option_seed + 1_000_000,
+            )
             prediction = surrogate.predict(pool)
-            acquisition = select_next_candidate(
-                AcquisitionInput(
+            acquisition_input = AcquisitionInput(
+                candidates=pool,
+                observed_x=observed_x.tolist(),
+                observed_y=observed_y.tolist(),
+                surrogate_mean=prediction.mean,
+                surrogate_std=prediction.std,
+                strategy=acquisition_strategy,
+            )
+            strategy_scores = np.asarray(score_candidates(acquisition_input), dtype=float)
+            best_y = float(np.min(observed_y)) if len(observed_y) else 0.0
+            ei_scores = np.asarray(
+                expected_improvement(prediction.mean, prediction.std, best_y=best_y, xi=0.001),
+                dtype=float,
+            )
+            optimisation_utility = (
+                0.65 * _scale_candidates_01(strategy_scores)
+                + 0.35 * _scale_candidates_01(ei_scores)
+            )
+            information, confirmation, falsification, confirm_targets, falsify_targets = (
+                _candidate_information_values(
                     candidates=pool,
-                    observed_x=observed_x.tolist(),
-                    observed_y=observed_y.tolist(),
-                    surrogate_mean=prediction.mean,
                     surrogate_std=prediction.std,
-                    strategy=acquisition_strategy,
+                    observed_x=observed_x,
+                    hypotheses=hypotheses,
+                    world_model_entropy=world_model_entropy,
                 )
             )
-            x = [float(value) for value in acquisition.selected_x]
-            selected_index = int(acquisition.selected_index)
-            score = float(acquisition.score)
+            if evidence_role == "confirm":
+                role_information = confirmation
+                targets = confirm_targets
+            elif evidence_role == "falsify":
+                role_information = falsification
+                targets = falsify_targets
+            else:
+                role_information = information
+                targets = [None] * len(pool)
+            if evidence_role == "optimize":
+                joint_scores = (
+                    (1.0 - information_weight) * optimisation_utility
+                    + information_weight * _scale_candidates_01(information)
+                )
+            else:
+                joint_scores = (
+                    (1.0 - information_weight) * optimisation_utility
+                    + information_weight * _scale_candidates_01(role_information)
+                )
+            selected_index = int(np.argmax(joint_scores))
+            x = [float(value) for value in pool[selected_index]]
+            score = float(strategy_scores[selected_index])
             alignment = _hypothesis_alignment(x, active_hypotheses or [])
             selection_score = _adjust_score_for_hypothesis(
-                score=score,
+                score=float(joint_scores[selected_index]),
                 alignment=alignment,
                 weight=float(hypothesis_alignment_weight),
             )
+            target_hypothesis_id = targets[selected_index] if selected_index < len(targets) else None
             options.append(
                 {
                     "candidate_id": f"{strategy}_{option_index + 1}",
@@ -833,7 +929,15 @@ def _build_strategy_candidate_options(
                     "x_unit": x,
                     "acquisition_strategy": acquisition_strategy,
                     "acquisition_score": score,
+                    "expected_improvement": float(ei_scores[selected_index]),
+                    "optimisation_utility": float(optimisation_utility[selected_index]),
+                    "information_gain": float(information[selected_index]),
+                    "confirmation_value": float(confirmation[selected_index]),
+                    "falsification_value": float(falsification[selected_index]),
+                    "joint_score": float(joint_scores[selected_index]),
                     "selection_score": selection_score,
+                    "evidence_role": evidence_role,
+                    "target_hypothesis_id": target_hypothesis_id,
                     "hypothesis_alignment": alignment,
                     "surrogate_mean": float(prediction.mean[selected_index]),
                     "surrogate_std": float(prediction.std[selected_index]),
@@ -842,6 +946,149 @@ def _build_strategy_candidate_options(
                 }
             )
     return options
+
+
+def _augment_pool_with_hypothesis_tests(
+    pool: Sequence[Sequence[float]],
+    *,
+    hypotheses: Sequence[Mapping[str, object]],
+    dim: int,
+    n_points: int,
+    seed: int,
+) -> list[list[float]]:
+    """Inject confirmation points and boundary counterexamples into a pool."""
+
+    base = [[float(value) for value in point] for point in pool]
+    if not hypotheses or n_points <= 0:
+        return base[: max(0, int(n_points))]
+    rng = np.random.default_rng(int(seed))
+    tests: list[list[float]] = []
+    for hypothesis in hypotheses:
+        center = _valid_region_center(hypothesis.get("region_center"), dim=dim)
+        radius = _valid_region_radius(hypothesis.get("region_radius"))
+        if center is None or radius is None:
+            continue
+        dims = _valid_sensitive_dims(hypothesis.get("sensitive_dims"), dim=dim)
+        confirm = np.asarray(center, dtype=float)
+        confirm[dims] += rng.normal(0.0, max(0.01, 0.30 * radius), size=len(dims))
+        tests.append(np.clip(confirm, 0.0, 1.0).astype(float).tolist())
+
+        direction = rng.normal(0.0, 1.0, size=len(dims))
+        norm = float(np.linalg.norm(direction))
+        if norm <= 1e-12:
+            direction = np.ones(len(dims), dtype=float) / math.sqrt(max(len(dims), 1))
+        else:
+            direction /= norm
+        falsify = np.asarray(center, dtype=float)
+        falsify[dims] += direction * radius * 1.15
+        tests.append(np.clip(falsify, 0.0, 1.0).astype(float).tolist())
+
+    combined = [*tests, *base]
+    unique: list[list[float]] = []
+    seen: set[tuple[float, ...]] = set()
+    for point in combined:
+        key = tuple(round(float(value), 12) for value in point)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(point)
+        if len(unique) >= int(n_points):
+            break
+    return unique
+
+
+def _candidate_information_values(
+    *,
+    candidates: Sequence[Sequence[float]],
+    surrogate_std: Sequence[float],
+    observed_x: np.ndarray,
+    hypotheses: Sequence[Mapping[str, object]],
+    world_model_entropy: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str | None], list[str | None]]:
+    """Approximate expected entropy reduction for world-model hypotheses.
+
+    Confirmation value is largest inside a hypothesis region; falsification
+    value is largest near its boundary. Both are weighted by the current binary
+    hypothesis entropy and predictive uncertainty. A global component continues
+    to reduce uncertain world-model properties when no explicit hypothesis is
+    active.
+    """
+
+    points = np.asarray(candidates, dtype=float)
+    std = np.asarray(surrogate_std, dtype=float)
+    n = len(points)
+    if n == 0:
+        empty = np.empty((0,), dtype=float)
+        return empty, empty, empty, [], []
+    uncertainty = _scale_candidates_01(std)
+    novelty = np.asarray(
+        [_distance_to_nearest_observation(point, observed_x) for point in points],
+        dtype=float,
+    )
+    novelty = _scale_candidates_01(novelty)
+    model_entropy = float(np.clip(world_model_entropy, 0.0, 1.0))
+    global_information = model_entropy * uncertainty * (0.25 + 0.75 * novelty)
+
+    confirmation = np.zeros(n, dtype=float)
+    falsification = np.zeros(n, dtype=float)
+    confirm_targets: list[str | None] = [None] * n
+    falsify_targets: list[str | None] = [None] * n
+    for hypothesis in hypotheses:
+        posterior = _candidate_float(
+            hypothesis,
+            "posterior_probability",
+            default=_candidate_float(hypothesis, "confidence", default=0.5),
+        )
+        entropy = _binary_entropy(posterior)
+        if entropy <= 1e-12:
+            continue
+        ratios = _hypothesis_distance_ratios(points, hypothesis)
+        confirm_kernel = np.exp(-0.5 * (ratios / 0.75) ** 2)
+        falsify_kernel = np.exp(-0.5 * ((ratios - 1.0) / 0.35) ** 2)
+        uncertainty_factor = 0.20 + 0.80 * uncertainty
+        confirm_value = entropy * uncertainty_factor * confirm_kernel
+        falsify_value = entropy * uncertainty_factor * falsify_kernel
+        hypothesis_id = str(hypothesis.get("hypothesis_id")) if hypothesis.get("hypothesis_id") else None
+        for index in range(n):
+            if confirm_value[index] > confirmation[index]:
+                confirmation[index] = float(confirm_value[index])
+                confirm_targets[index] = hypothesis_id
+            if falsify_value[index] > falsification[index]:
+                falsification[index] = float(falsify_value[index])
+                falsify_targets[index] = hypothesis_id
+    information = np.maximum(global_information, np.maximum(confirmation, falsification))
+    return information, confirmation, falsification, confirm_targets, falsify_targets
+
+
+def _hypothesis_distance_ratios(
+    candidates: np.ndarray,
+    hypothesis: Mapping[str, object],
+) -> np.ndarray:
+    dim = int(candidates.shape[1])
+    center = _valid_region_center(hypothesis.get("region_center"), dim=dim)
+    radius = _valid_region_radius(hypothesis.get("region_radius"))
+    if center is None or radius is None:
+        return np.full(len(candidates), np.inf, dtype=float)
+    dims = _valid_sensitive_dims(hypothesis.get("sensitive_dims"), dim=dim)
+    delta = candidates[:, dims] - np.asarray(center, dtype=float)[dims]
+    return np.linalg.norm(delta, axis=1) / max(radius, 1e-12)
+
+
+def _binary_entropy(probability: float) -> float:
+    probability = float(np.clip(probability, 1e-9, 1.0 - 1e-9))
+    entropy = -probability * math.log(probability) - (1.0 - probability) * math.log(1.0 - probability)
+    return float(entropy / math.log(2.0))
+
+
+def _scale_candidates_01(values: Sequence[float]) -> np.ndarray:
+    array = np.asarray(values, dtype=float)
+    if array.size == 0:
+        return array
+    lower = float(np.min(array))
+    spread = float(np.max(array) - lower)
+    if spread <= 1e-12:
+        return np.ones_like(array)
+    return (array - lower) / spread
 
 
 def _select_strategy_candidate(
@@ -940,6 +1187,15 @@ def _verify_candidate_with_gp(
         "original_acquisition_score": _candidate_acquisition_score(selected),
         "original_surrogate_std": _candidate_float(selected, "surrogate_std"),
     }
+    evidence_role = str(selected.get("evidence_role", "optimize"))
+    targeted_information_test = bool(
+        evidence_role in {"confirm", "falsify"} and selected.get("target_hypothesis_id")
+    )
+    if targeted_information_test:
+        metadata["action"] = "accepted_information_test"
+        metadata["evidence_role"] = evidence_role
+        metadata["target_hypothesis_id"] = selected.get("target_hypothesis_id")
+        return selected, metadata, None
     if not enabled or len(matching) <= 1:
         return selected, metadata, None
 

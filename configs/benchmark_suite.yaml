@@ -39,6 +39,12 @@ logging:
 wmbo:
   candidate_options_per_strategy: 5
   hypothesis_alignment_weight: 0.15
+  information_gain_weight: 0.35
+  hypothesis_support_probability: 0.80
+  hypothesis_rejection_probability: 0.20
+  hypothesis_support_likelihood_ratio: 3.0
+  hypothesis_failure_likelihood_ratio: 0.50
+  hypothesis_min_relevant_evidence: 1
   gp_verifier_enabled: true
   gp_verifier_min_score_ratio: 0.75
   gp_verifier_duplicate_distance: 0.0001

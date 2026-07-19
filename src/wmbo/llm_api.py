@@ -384,12 +384,16 @@ def build_world_model_messages(
         "falsification_rule must state what future evidence would reject or refine the hypothesis. "
         "Use descriptor fields such as coverage, boundary_bias, stagnation, improvement_rate, "
         "dimension_sensitivity, and sensitive_dims as evidence for exploration versus exploitation, "
+        "and use property_posteriors, credible_intervals, and calibration to avoid treating uncertain labels as facts. "
         "but keep the required output schema unchanged. "
         "Allowed smoothness: smooth, mixed, rugged, unknown. "
         "Allowed modality: mostly_unimodal, multimodal, highly_multimodal, unknown. "
         "Allowed curvature/anisotropy: low, moderate, high, unknown. "
         "confidence must be numeric in [0, 1]. "
         "When candidate_options are provided, selected_candidate_id must be one of their candidate_id values. "
+        "Candidate options may be labelled optimize, confirm, or falsify and include expected_improvement, "
+        "information_gain, and joint_score. Prefer a targeted confirm/falsify option when hypothesis or "
+        "world-model entropy is high, while retaining optimisation value through joint_score. "
         "Never invent coordinates; select an existing candidate by ID."
     )
     payload = {

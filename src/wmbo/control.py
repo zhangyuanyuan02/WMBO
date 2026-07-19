@@ -109,7 +109,7 @@ class WMBOControlConfig:
 
     early_fraction: float = 0.35
     late_fraction: float = 0.70
-    candidate_options_per_strategy: int = 2
+    candidate_options_per_strategy: int = 3
     global_max_consecutive_early: int = 2
     global_max_consecutive_middle: int = 1
     trust_initial: float = 0.5
@@ -117,12 +117,18 @@ class WMBOControlConfig:
     trust_window: int = 5
     failure_cooldown_trials: int = 2
     hypothesis_window: int = 3
+    hypothesis_support_probability: float = 0.80
+    hypothesis_rejection_probability: float = 0.20
+    hypothesis_support_likelihood_ratio: float = 3.0
+    hypothesis_failure_likelihood_ratio: float = 0.50
+    hypothesis_min_relevant_evidence: int = 1
     middle_global_uncertainty_threshold: float = 0.55
     late_explore_uncertainty_threshold: float = 0.65
     multimodal_explore_interval: int = 4
     multimodal_explore_uncertainty_threshold: float = 0.30
     multimodal_late_explore_uncertainty_threshold: float = 0.45
     hypothesis_alignment_weight: float = 0.15
+    information_gain_weight: float = 0.35
     gp_verifier_enabled: bool = True
     gp_verifier_min_score_ratio: float = 0.75
     gp_verifier_duplicate_distance: float = 1e-4
@@ -143,6 +149,13 @@ class HypothesisRecord:
     region_radius: float | None = None
     sensitive_dims: Sequence[int] = field(default_factory=tuple)
     falsification_rule: str | None = None
+    posterior_probability: float = 0.5
+    log_likelihood_ratio: float = 0.0
+    evidence_count: int = 0
+    relevant_evidence_count: int = 0
+    supporting_evidence: int = 0
+    contradicting_evidence: int = 0
+    last_evidence: Mapping[str, Any] | None = None
     status: str = "active"
 
     def to_dict(self) -> dict[str, Any]:
@@ -160,6 +173,13 @@ class HypothesisRecord:
             "region_radius": self.region_radius,
             "sensitive_dims": [int(dim) for dim in self.sensitive_dims],
             "falsification_rule": self.falsification_rule,
+            "posterior_probability": self.posterior_probability,
+            "log_likelihood_ratio": self.log_likelihood_ratio,
+            "evidence_count": self.evidence_count,
+            "relevant_evidence_count": self.relevant_evidence_count,
+            "supporting_evidence": self.supporting_evidence,
+            "contradicting_evidence": self.contradicting_evidence,
+            "last_evidence": dict(self.last_evidence) if self.last_evidence is not None else None,
             "status": self.status,
         }
 
@@ -175,6 +195,7 @@ class StrategyRecord:
     best_y: float
     trust_after: float
     cooldown_until: int | None = None
+    hypothesis_updates: Sequence[Mapping[str, Any]] = field(default_factory=tuple)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert the outcome record to a JSON-friendly dictionary."""
@@ -187,6 +208,7 @@ class StrategyRecord:
             "best_y": self.best_y,
             "trust_after": self.trust_after,
             "cooldown_until": self.cooldown_until,
+            "hypothesis_updates": [dict(update) for update in self.hypothesis_updates],
         }
 
 
@@ -375,9 +397,11 @@ class WMBOState:
         hypothesis_text = str(text).strip()
         if not hypothesis_text:
             return None
+        trial = int(trial_number)
         for record in self.hypotheses:
-            if record.strategy == strategy and record.status == "active":
-                record.status = "expired"
+            if record.status == "active" and trial > record.expires_trial:
+                record.status = "inconclusive"
+        prior_probability = _clamp(confidence, 0.05, 0.95)
         self.hypothesis_counter += 1
         record = HypothesisRecord(
             hypothesis_id=f"h{self.hypothesis_counter}",
@@ -386,17 +410,31 @@ class WMBOState:
             created_trial=int(trial_number),
             expires_trial=int(trial_number) + max(1, int(self.config.hypothesis_window)) - 1,
             baseline_best=float(baseline_best),
-            confidence=_clamp(confidence, 0.0, 1.0),
+            confidence=prior_probability,
             region_center=_normalise_region_center(region_center),
             region_radius=_normalise_region_radius(region_radius),
             sensitive_dims=_normalise_sensitive_dims(sensitive_dims),
             falsification_rule=_normalise_text(falsification_rule),
+            posterior_probability=prior_probability,
         )
         self.hypotheses.append(record)
         return record
 
-    def record_outcome(self, strategy: str, trial_number: int, improved: bool, y: float, best_y: float) -> StrategyRecord:
-        """Update trust, cooldowns, and hypothesis statuses after one trial."""
+    def record_outcome(
+        self,
+        strategy: str,
+        trial_number: int,
+        improved: bool,
+        y: float,
+        best_y: float,
+        *,
+        candidate: Sequence[float] | None = None,
+        predicted_mean: float | None = None,
+        predicted_std: float | None = None,
+        evidence_role: str | None = None,
+        target_hypothesis_id: str | None = None,
+    ) -> StrategyRecord:
+        """Update trust and only apply evidence relevant to each hypothesis."""
 
         key = str(strategy).strip().lower().replace("-", "_")
         if key not in STRATEGIES:
@@ -415,13 +453,17 @@ class WMBOState:
             cooldown = int(trial_number) + int(self.config.failure_cooldown_trials) + 1
             self.cooldown_until[key] = cooldown
 
-        for record in self.hypotheses:
-            if record.status != "active":
-                continue
-            if improved and float(best_y) < record.baseline_best:
-                record.status = "supported"
-            elif int(trial_number) >= record.expires_trial:
-                record.status = "rejected"
+        hypothesis_updates = self._update_hypotheses(
+            trial_number=int(trial_number),
+            improved=bool(improved),
+            y=float(y),
+            best_y=float(best_y),
+            candidate=candidate,
+            predicted_mean=predicted_mean,
+            predicted_std=predicted_std,
+            evidence_role=evidence_role,
+            target_hypothesis_id=target_hypothesis_id,
+        )
 
         outcome = StrategyRecord(
             strategy=key,
@@ -431,9 +473,101 @@ class WMBOState:
             best_y=float(best_y),
             trust_after=float(self.trusts[key]),
             cooldown_until=cooldown,
+            hypothesis_updates=hypothesis_updates,
         )
         self.strategy_history.append(outcome)
         return outcome
+
+    def _update_hypotheses(
+        self,
+        *,
+        trial_number: int,
+        improved: bool,
+        y: float,
+        best_y: float,
+        candidate: Sequence[float] | None,
+        predicted_mean: float | None,
+        predicted_std: float | None,
+        evidence_role: str | None,
+        target_hypothesis_id: str | None,
+    ) -> list[dict[str, Any]]:
+        """Apply one evaluation only to hypotheses for which it is evidence."""
+
+        updates: list[dict[str, Any]] = []
+        for record in self.hypotheses:
+            if record.status != "active":
+                continue
+            record.evidence_count += 1
+            relevant, distance_ratio = _hypothesis_relevance(
+                record,
+                candidate=candidate,
+                evidence_role=evidence_role,
+                target_hypothesis_id=target_hypothesis_id,
+            )
+            update: dict[str, Any] = {
+                "hypothesis_id": record.hypothesis_id,
+                "relevant": relevant,
+                "distance_ratio": distance_ratio,
+                "evidence_role": evidence_role,
+                "prior_probability": record.posterior_probability,
+            }
+            if relevant:
+                record.relevant_evidence_count += 1
+                tolerance = max(1e-8, 0.001 * max(abs(record.baseline_best), 1.0))
+                supports = bool(improved and float(best_y) < record.baseline_best - tolerance)
+                likelihood_ratio = (
+                    float(self.config.hypothesis_support_likelihood_ratio)
+                    if supports
+                    else float(self.config.hypothesis_failure_likelihood_ratio)
+                )
+                likelihood_ratio = max(likelihood_ratio, 1e-6)
+                surprise_z: float | None = None
+                if predicted_mean is not None and predicted_std is not None:
+                    scale = max(abs(float(predicted_std)), 1e-8)
+                    surprise_z = (float(y) - float(predicted_mean)) / scale
+                evidence_strength = 1.0
+                if surprise_z is not None and math.isfinite(surprise_z):
+                    evidence_strength = _clamp(0.5 + 0.25 * abs(surprise_z), 0.5, 2.0)
+                log_update = math.log(likelihood_ratio) * evidence_strength
+                record.log_likelihood_ratio += log_update
+                record.posterior_probability = _sigmoid(
+                    _logit(record.confidence) + record.log_likelihood_ratio
+                )
+                if supports:
+                    record.supporting_evidence += 1
+                else:
+                    record.contradicting_evidence += 1
+                minimum = max(1, int(self.config.hypothesis_min_relevant_evidence))
+                if record.relevant_evidence_count >= minimum:
+                    if record.posterior_probability >= float(self.config.hypothesis_support_probability):
+                        record.status = "supported"
+                    elif record.posterior_probability <= float(self.config.hypothesis_rejection_probability):
+                        record.status = "rejected"
+                record.last_evidence = {
+                    "trial_number": int(trial_number),
+                    "candidate": [float(value) for value in candidate] if candidate is not None else None,
+                    "y": float(y),
+                    "best_y": float(best_y),
+                    "improved": bool(improved),
+                    "supports": supports,
+                    "likelihood_ratio": likelihood_ratio,
+                    "log_likelihood_update": log_update,
+                    "surprise_z": surprise_z,
+                    "evidence_role": evidence_role,
+                    "distance_ratio": distance_ratio,
+                }
+                update.update(record.last_evidence)
+            if record.status == "active" and int(trial_number) >= record.expires_trial:
+                record.status = "inconclusive"
+            update.update(
+                {
+                    "posterior_probability": record.posterior_probability,
+                    "relevant_evidence_count": record.relevant_evidence_count,
+                    "status": record.status,
+                }
+            )
+            updates.append(update)
+        return updates
 
     def to_dict(self) -> dict[str, Any]:
         """Return the controller state in a JSON-friendly form."""
@@ -489,6 +623,51 @@ class WMBOState:
         if float(uncertainty) < float(threshold):
             return None
         return exploratory[0]
+
+
+def _hypothesis_relevance(
+    record: HypothesisRecord,
+    *,
+    candidate: Sequence[float] | None,
+    evidence_role: str | None,
+    target_hypothesis_id: str | None,
+) -> tuple[bool, float | None]:
+    """Return whether a candidate is an in-region or explicit hypothesis test."""
+
+    role = str(evidence_role or "").strip().lower()
+    targeted = bool(
+        target_hypothesis_id == record.hypothesis_id and role in {"confirm", "falsify"}
+    )
+    if candidate is None or record.region_center is None or record.region_radius is None:
+        return targeted, None
+    try:
+        point = [float(value) for value in candidate]
+        center = [float(value) for value in record.region_center]
+        radius = float(record.region_radius)
+    except (TypeError, ValueError):
+        return targeted, None
+    if len(point) != len(center) or radius <= 0.0:
+        return targeted, None
+    dims = [int(dim) for dim in record.sensitive_dims if 0 <= int(dim) < len(point)]
+    if not dims:
+        dims = list(range(len(point)))
+    distance = math.sqrt(sum((point[index] - center[index]) ** 2 for index in dims))
+    distance_ratio = float(distance / max(radius, 1e-12))
+    return bool(distance_ratio <= 1.0 or targeted), distance_ratio
+
+
+def _logit(probability: float) -> float:
+    bounded = _clamp(probability, 1e-6, 1.0 - 1e-6)
+    return math.log(bounded / (1.0 - bounded))
+
+
+def _sigmoid(value: float) -> float:
+    bounded = _clamp(value, -60.0, 60.0)
+    if bounded >= 0.0:
+        scale = math.exp(-bounded)
+        return 1.0 / (1.0 + scale)
+    scale = math.exp(bounded)
+    return scale / (1.0 + scale)
 
 
 def _clamp(value: object, lower: float, upper: float) -> float:

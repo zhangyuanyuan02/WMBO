@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -56,6 +57,9 @@ class LandscapeDescriptor:
     improvement_rate: float | None = None
     dimension_sensitivity: Sequence[float] = field(default_factory=tuple)
     sensitive_dims: Sequence[int] = field(default_factory=tuple)
+    property_posteriors: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
+    credible_intervals: Mapping[str, Sequence[float]] = field(default_factory=dict)
+    calibration: Mapping[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         """Convert the descriptor to a plain dictionary.
@@ -83,6 +87,15 @@ class LandscapeDescriptor:
             "improvement_rate": self.improvement_rate,
             "dimension_sensitivity": [float(value) for value in self.dimension_sensitivity],
             "sensitive_dims": [int(value) for value in self.sensitive_dims],
+            "property_posteriors": {
+                str(name): {str(label): float(probability) for label, probability in probabilities.items()}
+                for name, probabilities in self.property_posteriors.items()
+            },
+            "credible_intervals": {
+                str(name): [float(value) for value in interval]
+                for name, interval in self.credible_intervals.items()
+            },
+            "calibration": {str(name): float(value) for name, value in self.calibration.items()},
             "labels": dict(self.labels),
         }
 
@@ -124,7 +137,7 @@ def describe_landscape(
             dimension_sensitivity=tuple(),
             sensitive_dims=tuple(),
         )
-        return LandscapeDescriptor(**{**descriptor.__dict__, "labels": label_descriptor(descriptor)})
+        return _with_probabilistic_world_model(descriptor)
 
     smoothness = estimate_smoothness(x.tolist(), y.tolist())
     modality = estimate_modality(x.tolist(), y.tolist())
@@ -151,7 +164,126 @@ def describe_landscape(
         dimension_sensitivity=dimension_sensitivity,
         sensitive_dims=sensitive_dims,
     )
-    return LandscapeDescriptor(**{**descriptor.__dict__, "labels": label_descriptor(descriptor)})
+    return _with_probabilistic_world_model(descriptor)
+
+
+def estimate_property_posteriors(
+    descriptor: LandscapeDescriptor,
+) -> tuple[dict[str, dict[str, float]], dict[str, list[float]], dict[str, float]]:
+    """Estimate calibrated categorical posteriors for world-model properties.
+
+    Numeric landscape scores remain lightweight estimators. Instead of treating
+    thresholded labels as certain, each score is converted into a categorical
+    posterior whose width depends on sample size, dimensionality, coverage, and
+    surrogate uncertainty.
+    """
+
+    n = max(0, int(descriptor.num_observations))
+    dim = max(1, int(descriptor.dim))
+    coverage = float(np.clip(descriptor.coverage if descriptor.coverage is not None else 0.0, 0.0, 1.0))
+    uncertainty = float(
+        np.clip(descriptor.uncertainty if descriptor.uncertainty is not None else 1.0, 0.0, 1.0)
+    )
+    evidence_ratio = float(n / (n + max(4, 2 * dim))) if n else 0.0
+    standard_error = float(
+        np.clip(
+            0.08 + 0.24 * (1.0 - evidence_ratio) + 0.10 * uncertainty + 0.08 * (1.0 - coverage),
+            0.06,
+            0.45,
+        )
+    )
+    specifications: dict[str, tuple[float | None, tuple[str, ...], tuple[float, float]]] = {
+        "smoothness": (descriptor.smoothness, ("smooth", "mixed", "rugged"), (0.25, 0.55)),
+        "modality": (
+            descriptor.modality,
+            ("mostly_unimodal", "multimodal", "highly_multimodal"),
+            (0.25, 0.65),
+        ),
+        "curvature": (descriptor.curvature, ("low", "moderate", "high"), (0.25, 0.65)),
+        "anisotropy": (descriptor.anisotropy, ("low", "moderate", "high"), (0.25, 0.65)),
+    }
+    posteriors: dict[str, dict[str, float]] = {}
+    intervals: dict[str, list[float]] = {}
+    confidences: list[float] = []
+    entropies: list[float] = []
+    for name, (score, categories, thresholds) in specifications.items():
+        if score is None:
+            posteriors[name] = {"unknown": 1.0}
+            intervals[name] = [0.0, 1.0]
+            confidences.append(0.0)
+            entropies.append(1.0)
+            continue
+        bounded_score = float(np.clip(score, 0.0, 1.0))
+        probabilities = _categorical_posterior(
+            score=bounded_score,
+            standard_error=standard_error,
+            categories=categories,
+            thresholds=thresholds,
+        )
+        posteriors[name] = probabilities
+        intervals[name] = [
+            float(np.clip(bounded_score - 1.96 * standard_error, 0.0, 1.0)),
+            float(np.clip(bounded_score + 1.96 * standard_error, 0.0, 1.0)),
+        ]
+        confidences.append(max(probabilities.values()))
+        entropies.append(_normalised_entropy(tuple(probabilities.values())))
+
+    calibration = {
+        "effective_sample_ratio": evidence_ratio,
+        "posterior_standard_error": standard_error,
+        "posterior_confidence": float(np.mean(confidences)) if confidences else 0.0,
+        "world_model_entropy": float(np.mean(entropies)) if entropies else 1.0,
+    }
+    return posteriors, intervals, calibration
+
+
+def _with_probabilistic_world_model(descriptor: LandscapeDescriptor) -> LandscapeDescriptor:
+    posteriors, intervals, calibration = estimate_property_posteriors(descriptor)
+    enriched = LandscapeDescriptor(
+        **{
+            **descriptor.__dict__,
+            "property_posteriors": posteriors,
+            "credible_intervals": intervals,
+            "calibration": calibration,
+        }
+    )
+    return LandscapeDescriptor(**{**enriched.__dict__, "labels": label_descriptor(enriched)})
+
+
+def _categorical_posterior(
+    *,
+    score: float,
+    standard_error: float,
+    categories: Sequence[str],
+    thresholds: Sequence[float],
+) -> dict[str, float]:
+    if len(categories) != 3 or len(thresholds) != 2:
+        raise ValueError("Three categories and two thresholds are required.")
+    sigma = max(float(standard_error), 1e-6)
+    lower, upper = (float(thresholds[0]), float(thresholds[1]))
+    cdf_lower = _normal_cdf((lower - float(score)) / sigma)
+    cdf_upper = _normal_cdf((upper - float(score)) / sigma)
+    values = np.asarray(
+        [cdf_lower, max(0.0, cdf_upper - cdf_lower), max(0.0, 1.0 - cdf_upper)],
+        dtype=float,
+    )
+    total = float(np.sum(values))
+    values = values / total if total > 1e-12 else np.full(3, 1.0 / 3.0, dtype=float)
+    return {str(category): float(value) for category, value in zip(categories, values)}
+
+
+def _normal_cdf(value: float) -> float:
+    return 0.5 * (1.0 + math.erf(float(value) / math.sqrt(2.0)))
+
+
+def _normalised_entropy(probabilities: Sequence[float]) -> float:
+    values = [max(0.0, float(value)) for value in probabilities]
+    total = sum(values)
+    if total <= 1e-12 or len(values) <= 1:
+        return 0.0
+    normalised = [value / total for value in values]
+    entropy = -sum(value * math.log(value) for value in normalised if value > 1e-12)
+    return float(np.clip(entropy / math.log(len(normalised)), 0.0, 1.0))
 
 
 def estimate_smoothness(observed_x: Matrix, observed_y: Sequence[float]) -> float:
@@ -473,6 +605,11 @@ def label_descriptor(descriptor: LandscapeDescriptor) -> dict[str, str]:
     else:
         progress_label = "active"
 
+    smoothness_label = _posterior_label(descriptor, "smoothness", smoothness_label)
+    modality_label = _posterior_label(descriptor, "modality", modality_label)
+    curvature_label = _posterior_label(descriptor, "curvature", curvature_label)
+    anisotropy_label = _posterior_label(descriptor, "anisotropy", anisotropy_label)
+
     return {
         "smoothness": smoothness_label,
         "modality": modality_label,
@@ -485,6 +622,18 @@ def label_descriptor(descriptor: LandscapeDescriptor) -> dict[str, str]:
         "dimension_profile": _dimension_profile_label(anisotropy_label),
         "sample_size": "small" if descriptor.num_observations < max(5, 2 * max(1, descriptor.dim)) else "usable",
     }
+
+
+def _posterior_label(descriptor: LandscapeDescriptor, name: str, fallback: str) -> str:
+    probabilities = descriptor.property_posteriors.get(name, {})
+    known = {
+        str(label): float(probability)
+        for label, probability in probabilities.items()
+        if str(label) != "unknown"
+    }
+    if not known:
+        return fallback
+    return max(known, key=lambda label: (known[label], label))
 
 
 def _select_sensitive_dims(sensitivity: np.ndarray, anisotropy: float) -> tuple[int, ...]:
@@ -615,6 +764,7 @@ def _as_observation_arrays(observed_x: Matrix, observed_y: Sequence[float]) -> t
 __all__ = [
     "LandscapeDescriptor",
     "describe_landscape",
+    "estimate_property_posteriors",
     "estimate_smoothness",
     "estimate_modality",
     "estimate_curvature",
