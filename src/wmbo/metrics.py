@@ -80,6 +80,7 @@ def summarise_run(
     seed: int,
     values: Sequence[float],
     optimum_value: float | None = None,
+    metadata: Mapping[str, object] | None = None,
 ) -> RunSummary:
     """Summarise one optimisation run.
 
@@ -89,6 +90,7 @@ def summarise_run(
         seed: Random seed.
         values: Objective values in evaluation order.
         optimum_value: Known global optimum, if available.
+        metadata: Optional domain-specific run metrics.
 
     Output:
         ``RunSummary`` containing final best value and regret.
@@ -111,6 +113,7 @@ def summarise_run(
             "regret_curve": regret_curve,
             "first_value": objective_values[0] if objective_values else None,
             "last_value": objective_values[-1] if objective_values else None,
+            **dict(metadata or {}),
         },
     )
 

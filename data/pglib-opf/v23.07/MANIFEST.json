@@ -1,0 +1,30 @@
+{
+  "dataset": "PGLib-OPF",
+  "version": "v23.07",
+  "source": "https://github.com/power-grid-lib/pglib-opf/tree/v23.07",
+  "license_file": "LICENSE",
+  "benchmarks": {
+    "opf_pglib_case14_typ_pg": {
+      "scenario_id": "pglib_opf_case14_ieee",
+      "variant": "typ",
+      "case_file": "pglib_opf_case14_ieee.m",
+      "sha256": "bd5c568621de65e4b0922317010868bc7fa94173807faa10ea8fdbbe77c28106",
+      "control_mode": "non_slack_active_pg",
+      "controllable_generator_ids": ["2"],
+      "bounds_mw": [[0.0, 59.0]],
+      "recommended_start_mw": [29.5],
+      "reference_cost": 2178.0804108368666
+    },
+    "opf_pglib_case14_api_pg": {
+      "scenario_id": "pglib_opf_case14_ieee__api",
+      "variant": "api",
+      "case_file": "api/pglib_opf_case14_ieee__api.m",
+      "sha256": "6e007be95df3f7171d0c9494c8cc3db1aca1a3a0f2073c3ffbfa43e7b0cd49a2",
+      "control_mode": "non_slack_active_pg",
+      "controllable_generator_ids": ["2"],
+      "bounds_mw": [[0.0, 230.0]],
+      "recommended_start_mw": [130.3011702003637],
+      "reference_cost": 5999.363080435895
+    }
+  }
+}

@@ -1,0 +1,33 @@
+experiment:
+  methods: [random, sobol, bo_ei, bo_pi, bo_lcb, simple_es, wmbo]
+  seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  budget: 50
+  initial_samples: 8
+  candidate_pool_size: 1024
+  output_dir: results/opf_benchmark
+
+benchmark_suite:
+  benchmarks:
+    - opf_pglib_case14_typ_pg
+    - opf_pglib_case14_api_pg
+
+optimizer:
+  options:
+    surrogate: gaussian_process
+
+evaluation:
+  opf:
+    penalty_weight: 100.0
+    failure_penalty: 1000000.0
+    feasibility_tolerance: 0.00001
+    backend:
+      julia_executable: julia
+      timeout_seconds: 30
+      startup_timeout_seconds: 180
+      warmup: true
+
+llm:
+  enabled: false
+
+logging:
+  verbose: true

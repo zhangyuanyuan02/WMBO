@@ -12,6 +12,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from wmbo.benchmarks import list_benchmarks
 from wmbo.config import default_run_config, load_run_config, merge_run_config
 from wmbo.control import OptimizerConfig, RunConfig
 from wmbo.llm_api import API_PROVIDER_ENV, available_api_providers
@@ -44,6 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--llm-api-key-env", type=str, default=None, help="Environment variable containing the API key.")
     parser.add_argument("--api-provider", type=str, default=None, help="Provider name from configs/llm_secrets.yaml.")
     parser.add_argument("--list-api-providers", action="store_true", help="List configured API providers and exit.")
+    parser.add_argument("--list-benchmarks", action="store_true", help="List benchmark names and exit.")
     parser.add_argument("--llm-temperature", type=float, default=None, help="LLM sampling temperature.")
     parser.add_argument("--llm-log-io", action="store_true", help="Print LLM request and response payloads for debugging.")
     parser.add_argument("--no-llm-fallback", action="store_true", help="Raise LLM errors instead of falling back to the rule agent.")
@@ -92,6 +94,7 @@ def build_run_config(args: argparse.Namespace) -> RunConfig:
             seed=merged.optimizer.seed,
             options=options,
         ),
+        evaluation=dict(merged.evaluation),
     )
 
 
@@ -128,6 +131,9 @@ def main() -> None:
 
     parser = build_parser()
     args = parser.parse_args()
+    if args.list_benchmarks:
+        print("\n".join(list_benchmarks()))
+        return
     if args.list_api_providers:
         providers = available_api_providers()
         print("\n".join(providers) if providers else "No API providers configured.")

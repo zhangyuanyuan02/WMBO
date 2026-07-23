@@ -1,0 +1,32 @@
+experiment:
+  methods: [random, bo_ei, wmbo]
+  seeds: [0]
+  budget: 12
+  initial_samples: 4
+  candidate_pool_size: 128
+  output_dir: results/opf_debug
+
+benchmark_suite:
+  benchmarks:
+    - opf_pglib_case14_typ_pg
+
+optimizer:
+  options:
+    surrogate: gaussian_process
+
+evaluation:
+  opf:
+    penalty_weight: 100.0
+    failure_penalty: 1000000.0
+    feasibility_tolerance: 0.00001
+    backend:
+      julia_executable: julia
+      timeout_seconds: 30
+      startup_timeout_seconds: 180
+      warmup: true
+
+llm:
+  enabled: false
+
+logging:
+  verbose: true

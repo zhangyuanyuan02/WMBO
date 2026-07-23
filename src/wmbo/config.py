@@ -43,6 +43,7 @@ def run_config_from_mapping(data: Mapping[str, Any]) -> RunConfig:
     optimizer_section = _mapping(data.get("optimizer", {}), section="optimizer")
     suite = _mapping(data.get("benchmark_suite", {}), section="benchmark_suite")
     logging_section = _mapping(data.get("logging", {}), section="logging")
+    evaluation_section = _mapping(data.get("evaluation", {}), section="evaluation")
     llm_section = _mapping(
         data.get("llm", data.get("llm_agent", optimizer_section.get("llm", {}))),
         section="llm",
@@ -91,6 +92,7 @@ def run_config_from_mapping(data: Mapping[str, Any]) -> RunConfig:
         seeds=seeds,
         output_dir=output_dir,
         optimizer=optimizer,
+        evaluation=dict(evaluation_section),
     )
 
 
@@ -160,6 +162,7 @@ def merge_run_config(
         seeds=new_seeds,
         output_dir=output_dir if output_dir is not None else base.output_dir,
         optimizer=optimizer,
+        evaluation=dict(base.evaluation),
     )
 
 

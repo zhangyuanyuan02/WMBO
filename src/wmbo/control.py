@@ -47,6 +47,7 @@ class RunConfig:
         seeds: Random seeds for repeated runs.
         output_dir: Directory for future results.
         optimizer: Shared optimiser configuration.
+        evaluation: Objective-evaluation backend options.
 
     Output:
         Passed to ``runner.run_benchmark_suite``.
@@ -57,6 +58,7 @@ class RunConfig:
     seeds: Sequence[int]
     output_dir: str
     optimizer: OptimizerConfig
+    evaluation: Mapping[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

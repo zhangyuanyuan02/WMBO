@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import math
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -90,12 +91,16 @@ def run_single_benchmark(request: BenchmarkRunRequest) -> BenchmarkRunResult:
     for step in range(request.budget):
         if log_enabled:
             _log(f"{run_label} step {step + 1}/{request.budget} ask")
-        x_unit = optimizer.ask(state)
+        if step == 0 and benchmark.recommended_start_unit is not None:
+            x_unit = [float(value) for value in benchmark.recommended_start_unit]
+        else:
+            x_unit = optimizer.ask(state)
         result = evaluate(
             EvaluationRequest(
                 benchmark_name=benchmark.name,
                 x_unit=x_unit,
                 seed=request.seed,
+                options=_evaluation_options(request.metadata),
             )
         )
         state = optimizer.tell(state, result)
@@ -103,6 +108,7 @@ def run_single_benchmark(request: BenchmarkRunRequest) -> BenchmarkRunResult:
         best_curve = cumulative_best(objective_values, minimise=True)
         regret_curve = simple_regret(best_curve, benchmark.optimum_value)
         optimiser_metadata = _extract_observation_metadata(state.metadata)
+        evaluation_metadata = dict(result.metadata)
         observation = {
             "step": step,
             "benchmark": benchmark.name,
@@ -113,6 +119,7 @@ def run_single_benchmark(request: BenchmarkRunRequest) -> BenchmarkRunResult:
             "y": float(result.y),
             "best_y": best_curve[-1],
             "simple_regret": regret_curve[-1],
+            **evaluation_metadata,
             **optimiser_metadata,
         }
         observations.append(
@@ -127,6 +134,7 @@ def run_single_benchmark(request: BenchmarkRunRequest) -> BenchmarkRunResult:
         seed=request.seed,
         values=objective_values,
         optimum_value=benchmark.optimum_value,
+        metadata=_summarise_opf_observations(observations) if benchmark.family == "opf" else {},
     )
     result = BenchmarkRunResult(
         request=request,
@@ -137,6 +145,9 @@ def run_single_benchmark(request: BenchmarkRunRequest) -> BenchmarkRunResult:
             "dim": benchmark.dim,
             "bounds": [list(bound) for bound in benchmark.bounds],
             "optimum_value": benchmark.optimum_value,
+            "family": benchmark.family,
+            "constrained": benchmark.constrained,
+            "benchmark_metadata": dict(benchmark.metadata),
             "optimizer_state": dict(state.metadata),
         },
     )
@@ -188,6 +199,7 @@ def run_benchmark_suite(config: RunConfig) -> list[BenchmarkRunResult]:
                         "initial_samples": config.optimizer.initial_samples,
                         "candidate_pool_size": config.optimizer.candidate_pool_size,
                         "options": dict(config.optimizer.options),
+                        "evaluation": dict(config.evaluation),
                         "run_index": run_index,
                         "total_runs": total_runs,
                     },
@@ -289,6 +301,29 @@ def _write_observations_csv(path: Path, observations: Sequence[Mapping[str, obje
         "y",
         "best_y",
         "simple_regret",
+        "family",
+        "constrained",
+        "generation_cost",
+        "reference_cost",
+        "normalised_cost_gap",
+        "feasible",
+        "pf_converged",
+        "total_violation",
+        "max_normalized_violation",
+        "max_voltage_violation",
+        "max_thermal_violation",
+        "max_angle_violation",
+        "generator_violation",
+        "power_balance_residual",
+        "evaluation_time",
+        "solver_time",
+        "termination_status",
+        "solver_error",
+        "scenario_id",
+        "score_kind",
+        "reference_kind",
+        "penalty_weight",
+        "failure_penalty",
         "strategy",
         "proposed_strategy",
         "executed_strategy",
@@ -340,13 +375,77 @@ def _write_observations_csv(path: Path, observations: Sequence[Mapping[str, obje
 
 def _write_summary_csv(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
     ensure_dir(path.parent)
-    fieldnames = ["benchmark_name", "method", "seed", "final_best", "final_regret", "num_evaluations"]
+    fieldnames = [
+        "benchmark_name", "method", "seed", "final_best", "final_regret", "num_evaluations",
+        "best_feasible_cost", "best_feasible_gap", "feasibility_rate", "evals_to_first_feasible",
+        "min_total_violation", "pf_failure_rate", "total_evaluation_time", "anytime_feasible_gap_auc",
+    ]
     with path.open("w", encoding="utf-8", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=fieldnames)
         writer.writeheader()
         for row in rows:
             writer.writerow({name: row.get(name) for name in fieldnames})
 
+
+
+def _evaluation_options(metadata: Mapping[str, object]) -> Mapping[str, object]:
+    raw = metadata.get("evaluation", {}) if isinstance(metadata, Mapping) else {}
+    return raw if isinstance(raw, Mapping) else {}
+
+
+def _summarise_opf_observations(observations: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    if not observations:
+        return {}
+    feasible = [observation for observation in observations if bool(observation.get("feasible", False))]
+    costs = [
+        value for value in (_finite_float(observation.get("generation_cost")) for observation in feasible)
+        if value is not None
+    ]
+    gaps = [
+        value for value in (_finite_float(observation.get("normalised_cost_gap")) for observation in feasible)
+        if value is not None
+    ]
+    violations = [
+        value for value in (_finite_float(observation.get("total_violation")) for observation in observations)
+        if value is not None
+    ]
+    times = [
+        value for value in (_finite_float(observation.get("evaluation_time")) for observation in observations)
+        if value is not None
+    ]
+    first_feasible = next(
+        (index for index, observation in enumerate(observations, start=1) if bool(observation.get("feasible", False))),
+        None,
+    )
+    best_gap = None
+    gap_curve: list[float] = []
+    for observation in observations:
+        gap = _finite_float(observation.get("normalised_cost_gap")) if observation.get("feasible") else None
+        if gap is not None:
+            best_gap = gap if best_gap is None else min(best_gap, gap)
+        if best_gap is not None:
+            gap_curve.append(max(0.0, best_gap))
+    return {
+        "best_feasible_cost": min(costs) if costs else None,
+        "best_feasible_gap": min(gaps) if gaps else None,
+        "feasibility_rate": len(feasible) / len(observations),
+        "evals_to_first_feasible": first_feasible,
+        "min_total_violation": min(violations) if violations else None,
+        "pf_failure_rate": sum(not bool(item.get("pf_converged", False)) for item in observations) / len(observations),
+        "total_evaluation_time": sum(times),
+        "anytime_feasible_gap_auc": sum(gap_curve) / len(gap_curve) if gap_curve else None,
+        "regret_label": "penalised_score_regret",
+    }
+
+
+def _finite_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _extract_observation_metadata(state_metadata: Mapping[str, object]) -> dict[str, object]:
@@ -468,6 +567,10 @@ def _format_step_log(
         parts.append(f"strategy={strategy}")
     if phase:
         parts.append(f"phase={phase}")
+    if observation.get("pf_converged") is not None:
+        parts.append(f"pf={observation.get('pf_converged')}")
+        parts.append(f"feasible={observation.get('feasible')}")
+        parts.append(f"violation={_format_number(observation.get('total_violation'))}")
     llm_error = observation.get("llm_error")
     if llm_error:
         parts.append(f"llm_error={str(llm_error)[:160]}")

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 import math
+from pathlib import Path
 import random
 from typing import Callable, Mapping, Sequence
 
@@ -32,6 +34,10 @@ class BenchmarkSpec:
     bounds: Bounds
     optimum_value: float | None = None
     tags: Mapping[str, str] = field(default_factory=dict)
+    family: str = "synthetic"
+    constrained: bool = False
+    recommended_start_unit: Vector | None = None
+    metadata: Mapping[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -50,6 +56,7 @@ class EvaluationRequest:
     benchmark_name: str
     x_unit: Vector
     seed: int | None = None
+    options: Mapping[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -96,6 +103,8 @@ def list_benchmarks() -> list[str]:
         "levy5",
         "griewank5",
         "styblinski5",
+        "opf_pglib_case14_typ_pg",
+        "opf_pglib_case14_api_pg",
     ]
 
 
@@ -110,6 +119,9 @@ def get_benchmark(name: str) -> BenchmarkSpec:
     """
 
     key, dim_arg = _parse_benchmark_name(name)
+
+    if key.startswith("opf_pglib_"):
+        return _get_opf_benchmark(key)
 
     if key == "branin":
         return BenchmarkSpec(
@@ -298,8 +310,16 @@ def evaluate(request: EvaluationRequest) -> EvaluationResult:
     spec = get_benchmark(request.benchmark_name)
     x_unit = _as_float_list(request.x_unit, name="x_unit")
     x_raw = denormalise(x_unit, spec.bounds)
-    objective = _get_objective(spec.name)
-    y = objective(x_raw)
+    evaluation_metadata: dict[str, object] = {}
+    if spec.family == "opf":
+        from .opf_backend import evaluate_opf
+
+        raw_options = request.options.get("opf", request.options)
+        opf_options = raw_options if isinstance(raw_options, Mapping) else {}
+        y, evaluation_metadata = evaluate_opf(spec.name, x_raw, opf_options)
+    else:
+        objective = _get_objective(spec.name)
+        y = objective(x_raw)
     return EvaluationResult(
         benchmark_name=spec.name,
         x_unit=x_unit,
@@ -310,8 +330,57 @@ def evaluate(request: EvaluationRequest) -> EvaluationResult:
             "optimum_value": spec.optimum_value,
             "seed": request.seed,
             "tags": dict(spec.tags),
+            "family": spec.family,
+            "constrained": spec.constrained,
+            **evaluation_metadata,
         },
     )
+
+
+def _get_opf_benchmark(name: str) -> BenchmarkSpec:
+    manifest = _load_opf_manifest()
+    benchmarks = manifest.get("benchmarks", {})
+    if not isinstance(benchmarks, Mapping) or name not in benchmarks:
+        raise ValueError(f"Unknown benchmark: {name}")
+    entry = benchmarks[name]
+    if not isinstance(entry, Mapping):
+        raise ValueError(f"Invalid OPF manifest entry: {name}")
+    bounds = [tuple(float(value) for value in pair) for pair in entry["bounds_mw"]]
+    start_raw = [float(value) for value in entry["recommended_start_mw"]]
+    start_unit = normalise(start_raw, bounds)
+    return BenchmarkSpec(
+        name=name,
+        dim=len(bounds),
+        bounds=bounds,
+        optimum_value=0.0,
+        tags={
+            "smoothness": "nonlinear",
+            "modality": "unknown",
+            "curvature": "high",
+            "anisotropy": "unknown",
+            "family": "opf",
+            "variant": str(entry.get("variant", "unknown")),
+        },
+        family="opf",
+        constrained=True,
+        recommended_start_unit=start_unit,
+        metadata={
+            "dataset": str(manifest.get("dataset", "PGLib-OPF")),
+            "dataset_version": str(manifest.get("version", "v23.07")),
+            **dict(entry),
+        },
+    )
+
+
+def _load_opf_manifest() -> Mapping[str, object]:
+    path = Path(__file__).resolve().parents[2] / "data" / "pglib-opf" / "v23.07" / "MANIFEST.json"
+    if not path.is_file():
+        raise ValueError(f"Missing OPF benchmark manifest: {path}")
+    with path.open("r", encoding="utf-8") as file:
+        data = json.load(file)
+    if not isinstance(data, Mapping):
+        raise ValueError("OPF benchmark manifest must be a JSON mapping.")
+    return data
 
 
 def sample_unit_points(n_points: int, dim: int, seed: int | None = None) -> list[list[float]]:

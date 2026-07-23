@@ -8,7 +8,10 @@ This repository is still at an early implementation stage. The current commit ad
 
 ```text
 configs/         Reproducible experiment settings
+data/            Versioned benchmark inputs and checksums
+julia/           Pinned PowerModels/Ipopt backend
 src/wmbo/        Python package source code
+tests/           Unit and optional Julia integration tests
 run_benchmark.py Command-line entry point
 requirements.txt Project dependencies
 ```
@@ -39,6 +42,7 @@ Implemented so far:
 - YAML configuration files for reproducible rule-based and LLM-assisted runs
 - LLM debug config and local secrets template
 - Plotting utilities for saved runner outputs
+- PGLib-OPF v23.07 case14 TYP/API benchmarks through a persistent Julia AC power-flow backend
 
 ## Examples
 
@@ -77,6 +81,39 @@ PY
 ```
 
 This writes figures under `results/debug/figures/`.
+
+## OPF benchmark
+
+The first OPF release vendors the PGLib-OPF v23.07 IEEE case14 TYP and API cases. Only non-slack generators with a non-zero active-power range become variables; case14 therefore has one `Pg` variable because its other three non-slack generator records are synchronous condensers with `Pmin=Pmax=0`.
+
+Install Julia 1.10 LTS with Juliaup, then resolve the pinned PowerModels 0.19.9 and Ipopt 1.4.1 environment:
+
+```powershell
+juliaup add 1.10
+julia +1.10 julia/setup.jl
+```
+
+List all available benchmarks without starting Julia:
+
+```powershell
+python run_benchmark.py --list-benchmarks
+```
+
+Run the 12-evaluation smoke configuration or the complete 2-case, 7-method, 10-seed suite:
+
+```powershell
+python run_benchmark.py --config configs/opf_debug.yaml
+python run_benchmark.py --config configs/opf_benchmark.yaml
+```
+
+Every method receives the same pinned first point. TYP uses the feasible PGLib base dispatch (`Pg=29.5 MW`); API uses its feasible restricted reference because the PGLib base dispatch violates constraints at the strict `1e-5` tolerance. This also means the API `Pg`-only feasible region is very narrow, a documented v1 limitation motivating a later `Pg+Vg` benchmark. Subsequent candidates run AC power flow only. Each observation records cost, reference cost, feasibility, convergence, violations, and timing. The scalar target is `normalised_cost_gap + 100 * total_violation`; a non-converged power flow receives `1e6`.
+
+Run the optional real Julia integration tests after setup:
+
+```powershell
+$env:WMBO_RUN_OPF_INTEGRATION = "1"
+python -m pytest tests/test_opf_integration.py
+```
 
 ## WMBO control options
 
@@ -144,4 +181,4 @@ The ignored `configs/llm_secrets.yaml` file may contain provider-specific keys o
 
 ## TODO
 
-- Add tests and result analysis
+- Add N-1 and load-scenario OPF extensions after the deterministic case14 benchmark is stable
