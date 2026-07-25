@@ -103,8 +103,8 @@ def list_benchmarks() -> list[str]:
         "levy5",
         "griewank5",
         "styblinski5",
-        "opf_pglib_case14_typ_pg",
-        "opf_pglib_case14_api_pg",
+        "opf_pglib_case14_typ_pgvg",
+        "opf_pglib_case14_api_pgvg",
     ]
 
 
@@ -345,8 +345,8 @@ def _get_opf_benchmark(name: str) -> BenchmarkSpec:
     entry = benchmarks[name]
     if not isinstance(entry, Mapping):
         raise ValueError(f"Invalid OPF manifest entry: {name}")
-    bounds = [tuple(float(value) for value in pair) for pair in entry["bounds_mw"]]
-    start_raw = [float(value) for value in entry["recommended_start_mw"]]
+    bounds = [tuple(float(value) for value in pair) for pair in entry["bounds"]]
+    start_raw = [float(value) for value in entry["recommended_start"]]
     start_unit = normalise(start_raw, bounds)
     return BenchmarkSpec(
         name=name,

@@ -214,12 +214,43 @@ class BayesianOptimizationOptimizer:
         if len(state.observations) < max(1, self.config.initial_samples):
             return self._initial.ask(state)
 
-        observed_x, observed_y = observations_to_arrays(state.observations, dim=state.benchmark.dim)
+        constrained = _constraint_handling_enabled(state, self.config)
+        if constrained:
+            failure_ratio = float(self.config.options.get("constraint_failure_ratio", 1.0e6))
+            observed_x, observed_y, constraint_log_ratio, feasible = constrained_observations_to_arrays(
+                state.observations,
+                dim=state.benchmark.dim,
+                failure_ratio=failure_ratio,
+            )
+            constraint_surrogate = _constraint_surrogate(
+                config=self.config,
+                dim=state.benchmark.dim,
+                step=state.step,
+                observed_x=observed_x,
+                constraint_log_ratio=constraint_log_ratio,
+            )
+        else:
+            observed_x, observed_y = observations_to_arrays(
+                state.observations,
+                dim=state.benchmark.dim,
+            )
+            feasible = np.ones(len(observed_y), dtype=bool)
+            constraint_surrogate = None
         candidate_pool = sample_unit_points(
             n_points=max(1, self.config.candidate_pool_size),
             dim=state.benchmark.dim,
             seed=self.config.seed + 10_000 + state.step,
         )
+        if constraint_surrogate is not None and np.any(feasible):
+            candidate_pool = _augment_pool_with_feasible_neighbourhood(
+                candidate_pool,
+                feasible_x=observed_x[feasible],
+                center=np.asarray(
+                    best_observation(state.observations, constrained=True).x,
+                    dtype=float,
+                ),
+                seed=self.config.seed + 11_000 + state.step,
+            )
         surrogate = make_surrogate(
             kind=str(self.config.options.get("surrogate", "gaussian_process")),
             dim=state.benchmark.dim,
@@ -230,6 +261,14 @@ class BayesianOptimizationOptimizer:
         )
         surrogate.fit(SurrogateDataset(x=observed_x.tolist(), y=observed_y.tolist()))
         prediction = surrogate.predict(candidate_pool)
+        feasibility_probability = None
+        constraint_std = None
+        if constraint_surrogate is not None:
+            feasibility_probability, _constraint_mean, constraint_std = _predict_feasibility(
+                constraint_surrogate,
+                candidate_pool,
+                feasible_x=observed_x[feasible] if np.any(feasible) else None,
+            )
         acquisition = select_next_candidate(
             AcquisitionInput(
                 candidates=candidate_pool,
@@ -238,6 +277,10 @@ class BayesianOptimizationOptimizer:
                 surrogate_mean=prediction.mean,
                 surrogate_std=prediction.std,
                 strategy=self.acquisition_strategy,
+                feasibility_probability=feasibility_probability,
+                constraint_std=constraint_std,
+                has_feasible_observation=bool(np.any(feasible)),
+                feasibility_floor=float(self.config.options.get("constraint_pof_floor", 0.05)),
             )
         )
         return list(acquisition.selected_x)
@@ -281,7 +324,17 @@ class EvolutionStrategyOptimizer:
 
         x_obs, y_obs = observations_to_arrays(state.observations, dim=state.benchmark.dim)
         elite_count = min(max(2, state.benchmark.dim), len(y_obs))
-        elite_indices = np.argsort(y_obs)[:elite_count]
+        constrained = _constraint_handling_enabled(state, self.config)
+        elite_indices = np.asarray(
+            sorted(
+                range(len(state.observations)),
+                key=lambda index: observation_rank_key(
+                    state.observations[index],
+                    constrained=constrained,
+                ),
+            )[:elite_count],
+            dtype=int,
+        )
         elite = x_obs[elite_indices]
         center = np.mean(elite, axis=0)
         scale = np.maximum(np.std(elite, axis=0), float(self.config.options.get("mutation_scale", 0.08)))
@@ -347,7 +400,34 @@ class WMBOOptimizer:
             self._last_acquisition = {"strategy": "random"}
             return candidate
 
-        observed_x, observed_y = observations_to_arrays(state.observations, dim=state.benchmark.dim)
+        constrained = _constraint_handling_enabled(state, self.config)
+        if constrained:
+            failure_ratio = float(self.config.options.get("constraint_failure_ratio", 1.0e6))
+            observed_x, observed_y, constraint_log_ratio, feasible = constrained_observations_to_arrays(
+                state.observations,
+                dim=state.benchmark.dim,
+                failure_ratio=failure_ratio,
+            )
+            constraint_surrogate = _constraint_surrogate(
+                config=self.config,
+                dim=state.benchmark.dim,
+                step=state.step,
+                observed_x=observed_x,
+                constraint_log_ratio=constraint_log_ratio,
+            )
+        else:
+            observed_x, observed_y = observations_to_arrays(
+                state.observations,
+                dim=state.benchmark.dim,
+            )
+            feasible = np.ones(len(observed_y), dtype=bool)
+            constraint_surrogate = None
+        ranked_best = best_observation(state.observations, constrained=constrained)
+        best_x = (
+            np.asarray(ranked_best.x, dtype=float)
+            if ranked_best is not None
+            else np.full(state.benchmark.dim, 0.5)
+        )
         surrogate = make_surrogate(
             kind=str(self.config.options.get("surrogate", "gaussian_process")),
             dim=state.benchmark.dim,
@@ -386,6 +466,11 @@ class WMBOOptimizer:
             hypothesis_alignment_weight=float(self._control.config.hypothesis_alignment_weight),
             information_gain_weight=float(self._control.config.information_gain_weight),
             world_model_entropy=float(descriptor.calibration.get("world_model_entropy", 1.0)),
+            constraint_surrogate=constraint_surrogate,
+            has_feasible_observation=bool(np.any(feasible)),
+            feasibility_floor=float(self.config.options.get("constraint_pof_floor", 0.05)),
+            best_x=best_x,
+            feasible_x=observed_x[feasible] if np.any(feasible) else None,
         )
         decision, agent_type, llm_error = self._decide(
             state=state,
@@ -438,7 +523,11 @@ class WMBOOptimizer:
             text=decision.hypothesis,
             strategy=executed_strategy,
             trial_number=state.step + 1,
-            baseline_best=float(np.min(observed_y)),
+            baseline_best=(
+                _constraint_progress_value(state.observations, constrained=constrained)
+                if state.observations
+                else float(np.min(observed_y))
+            ),
             confidence=structured_hypothesis["confidence"],
             region_center=structured_hypothesis["region_center"],
             region_radius=structured_hypothesis["region_radius"],
@@ -453,6 +542,8 @@ class WMBOOptimizer:
             "candidate": list(candidate),
             "predicted_mean": selected_option.get("surrogate_mean"),
             "predicted_std": selected_option.get("surrogate_std"),
+            "predicted_feasibility_probability": selected_option.get("predicted_feasibility_probability"),
+            "predicted_constraint_log_ratio": selected_option.get("predicted_constraint_log_ratio"),
             "evidence_role": selected_option.get("evidence_role"),
             "target_hypothesis_id": selected_option.get("target_hypothesis_id"),
         }
@@ -486,6 +577,8 @@ class WMBOOptimizer:
             "joint_score": selected_option.get("joint_score"),
             "expected_improvement": selected_option.get("expected_improvement"),
             "information_gain": selected_option.get("information_gain"),
+            "predicted_feasibility_probability": selected_option.get("predicted_feasibility_probability"),
+            "predicted_constraint_log_ratio": selected_option.get("predicted_constraint_log_ratio"),
             "candidate_override": candidate_override,
             "gp_verifier": gp_verifier_metadata,
             "wmbo_control": self._control.to_dict(),
@@ -497,6 +590,9 @@ class WMBOOptimizer:
             "expected_improvement": selected_option.get("expected_improvement"),
             "optimisation_utility": selected_option.get("optimisation_utility"),
             "information_gain": selected_option.get("information_gain"),
+            "predicted_feasibility_probability": selected_option.get("predicted_feasibility_probability"),
+            "predicted_constraint_log_ratio": selected_option.get("predicted_constraint_log_ratio"),
+            "constraint_std": selected_option.get("constraint_std"),
             "confirmation_value": selected_option.get("confirmation_value"),
             "falsification_value": selected_option.get("falsification_value"),
             "selected_candidate_id": selected_option.get("candidate_id"),
@@ -542,6 +638,25 @@ class WMBOOptimizer:
             "strategy_trust": dict(self._control.trusts),
             "strategy_success_rates": self._control.recent_success_rates(),
             "recent_hypotheses": self._control.hypothesis_summary(),
+            "feasible_observations": sum(
+                bool(item.metadata.get("feasible", False))
+                for item in state.observations
+            ),
+            "best_feasible_gap": min(
+                (
+                    _observation_objective(item)
+                    for item in state.observations
+                    if bool(item.metadata.get("feasible", False))
+                ),
+                default=None,
+            ),
+            "minimum_constraint_ratio": min(
+                (
+                    _observation_constraint_ratio(item, failure_ratio=1.0e6)
+                    for item in state.observations
+                ),
+                default=None,
+            ),
         }
         try:
             if self._llm_client is None:
@@ -588,20 +703,26 @@ class WMBOOptimizer:
             Updated optimiser state.
         """
 
-        previous_best = min((float(observation.y) for observation in state.observations), default=None)
+        constrained = _constraint_handling_enabled(state, self.config)
+        previous_best = _constraint_progress_value(
+            state.observations,
+            constrained=constrained,
+        )
         updated = append_observation(state, result)
         metadata = dict(updated.metadata)
 
         outcome_metadata: dict[str, object] | None = None
         if self._pending_trial is not None and previous_best is not None:
-            tolerance = max(1e-8, 0.001 * max(abs(previous_best), 1.0))
-            improved = bool(float(result.y) < previous_best - tolerance)
-            best_y = min(previous_best, float(result.y))
+            improved, outcome_y, best_y = _result_improves_constraint_progress(
+                state.observations,
+                result,
+                constrained=constrained,
+            )
             outcome = self._control.record_outcome(
                 strategy=str(self._pending_trial.get("strategy", "exploit_ei")),
                 trial_number=int(self._pending_trial.get("trial_number", updated.step)),
                 improved=improved,
-                y=float(result.y),
+                y=outcome_y,
                 best_y=best_y,
                 candidate=self._pending_trial.get("candidate"),
                 predicted_mean=self._pending_trial.get("predicted_mean"),
@@ -719,19 +840,44 @@ def append_observation(state: OptimizerState, result: EvaluationResult) -> Optim
     )
 
 
-def best_observation(observations: Sequence[Observation]) -> Observation | None:
+def best_observation(
+    observations: Sequence[Observation],
+    *,
+    constrained: bool = False,
+) -> Observation | None:
     """Return the best observation for a minimisation run.
 
     Input:
         observations: Observed input-output pairs.
 
     Output:
-        Observation with the smallest objective value, or ``None`` when empty.
+        Feasibility-first best observation for constrained runs, otherwise the
+        observation with the smallest scalar objective.
     """
 
     if not observations:
         return None
-    return min(observations, key=lambda observation: float(observation.y))
+    return min(
+        observations,
+        key=lambda observation: observation_rank_key(observation, constrained=constrained),
+    )
+
+
+def observation_rank_key(
+    observation: Observation,
+    *,
+    constrained: bool,
+) -> tuple[float, ...]:
+    """Return a deterministic feasibility-first minimisation key."""
+
+    if not constrained:
+        return (float(observation.y),)
+    feasible = bool(observation.metadata.get("feasible", False))
+    objective = _observation_objective(observation)
+    violation_ratio = _observation_constraint_ratio(observation, failure_ratio=1.0e6)
+    if feasible:
+        return (0.0, objective, violation_ratio, float(observation.y))
+    return (1.0, violation_ratio, objective, float(observation.y))
 
 
 def observations_to_arrays(observations: Sequence[Observation], dim: int) -> tuple[np.ndarray, np.ndarray]:
@@ -759,6 +905,182 @@ def observations_to_arrays(observations: Sequence[Observation], dim: int) -> tup
     if not np.all(np.isfinite(x)) or not np.all(np.isfinite(y)):
         raise ValueError("Observations must contain only finite values.")
     return x, y
+
+
+def constrained_observations_to_arrays(
+    observations: Sequence[Observation],
+    dim: int,
+    *,
+    failure_ratio: float = 1.0e6,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return inputs, physical objective, log constraint ratio, and feasibility."""
+
+    x, _ = observations_to_arrays(observations, dim=dim)
+    objective = np.asarray([_observation_objective(item) for item in observations], dtype=float)
+    ratio = np.asarray(
+        [
+            _observation_constraint_ratio(item, failure_ratio=failure_ratio)
+            for item in observations
+        ],
+        dtype=float,
+    )
+    constraint_log_ratio = np.log10(np.maximum(ratio, 1.0e-12))
+    feasible = np.asarray(
+        [bool(item.metadata.get("feasible", False)) for item in observations],
+        dtype=bool,
+    )
+    if not np.all(np.isfinite(objective)) or not np.all(np.isfinite(constraint_log_ratio)):
+        raise ValueError("Constrained observations must contain finite objective and constraint values.")
+    return x, objective, constraint_log_ratio, feasible
+
+
+def _constraint_handling_enabled(state: OptimizerState, config: OptimizerConfig) -> bool:
+    mode = str(config.options.get("constraint_handling", "auto")).strip().lower()
+    if mode in {"off", "false", "none", "legacy_penalty"}:
+        return False
+    return bool(state.benchmark.constrained)
+
+
+def _constraint_surrogate(
+    *,
+    config: OptimizerConfig,
+    dim: int,
+    step: int,
+    observed_x: np.ndarray,
+    constraint_log_ratio: np.ndarray,
+) -> Any:
+    surrogate = make_surrogate(
+        kind=str(config.options.get("surrogate", "gaussian_process")),
+        dim=dim,
+        options={
+            "seed": config.seed + 500_000 + step,
+            "noise_level": float(config.options.get("constraint_noise_level", 1e-6)),
+        },
+    )
+    surrogate.fit(
+        SurrogateDataset(
+            x=observed_x.tolist(),
+            y=constraint_log_ratio.tolist(),
+        )
+    )
+    return surrogate
+
+
+def _predict_feasibility(
+    constraint_surrogate: Any,
+    candidates: Sequence[Sequence[float]],
+    *,
+    feasible_x: np.ndarray | None = None,
+) -> tuple[list[float], list[float], list[float]]:
+    prediction = constraint_surrogate.predict(candidates)
+    mean = np.asarray(prediction.mean, dtype=float)
+    std = np.maximum(np.asarray(prediction.std, dtype=float), 1.0e-12)
+    z = (0.0 - mean) / std
+    erf = np.vectorize(math.erf)
+    probability = 0.5 * (1.0 + erf(z / math.sqrt(2.0)))
+    if feasible_x is not None and len(feasible_x):
+        candidate_array = np.asarray(candidates, dtype=float)
+        feasible_array = np.asarray(feasible_x, dtype=float)
+        distances = np.linalg.norm(
+            candidate_array[:, None, :] - feasible_array[None, :, :],
+            axis=2,
+        )
+        nearest_distance = np.min(distances, axis=1)
+        # A small-data GP can be extremely confident when extrapolating far from
+        # the observed feasible set.  Retain the learned PoF while applying a
+        # conservative locality prior until observations support that region.
+        locality = np.exp(-0.5 * np.square(nearest_distance / 0.15))
+        probability = probability * (0.05 + 0.95 * locality)
+    return (
+        np.clip(probability, 0.0, 1.0).astype(float).tolist(),
+        mean.astype(float).tolist(),
+        std.astype(float).tolist(),
+    )
+
+
+def _observation_objective(observation: Observation) -> float:
+    value = observation.metadata.get("normalised_cost_gap")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = float(observation.y)
+    return parsed if math.isfinite(parsed) else float(observation.y)
+
+
+def _observation_constraint_ratio(
+    observation: Observation,
+    *,
+    failure_ratio: float,
+) -> float:
+    if not bool(observation.metadata.get("pf_converged", True)):
+        return float(failure_ratio)
+    value = observation.metadata.get("constraint_ratio")
+    if value is None:
+        tolerance = observation.metadata.get("feasibility_tolerance", 1.0e-5)
+        violation = observation.metadata.get("max_normalized_violation", failure_ratio)
+        try:
+            value = float(violation) / max(float(tolerance), 1.0e-12)
+        except (TypeError, ValueError):
+            value = failure_ratio
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = failure_ratio
+    if not math.isfinite(parsed):
+        return float(failure_ratio)
+    return float(min(max(parsed, 0.0), failure_ratio))
+
+
+def _constraint_progress_value(
+    observations: Sequence[Observation],
+    *,
+    constrained: bool,
+) -> float | None:
+    if not observations:
+        return None
+    if not constrained:
+        return min(float(item.y) for item in observations)
+    feasible = [item for item in observations if bool(item.metadata.get("feasible", False))]
+    if feasible:
+        return min(_observation_objective(item) for item in feasible)
+    return min(
+        _observation_constraint_ratio(item, failure_ratio=1.0e6)
+        for item in observations
+    )
+
+
+def _result_improves_constraint_progress(
+    observations: Sequence[Observation],
+    result: EvaluationResult,
+    *,
+    constrained: bool,
+) -> tuple[bool, float, float]:
+    previous = _constraint_progress_value(observations, constrained=constrained)
+    if previous is None:
+        return False, float(result.y), float(result.y)
+    if not constrained:
+        tolerance = max(1e-8, 0.001 * max(abs(previous), 1.0))
+        current = float(result.y)
+        return current < previous - tolerance, current, min(previous, current)
+
+    previous_has_feasible = any(
+        bool(item.metadata.get("feasible", False)) for item in observations
+    )
+    result_observation = Observation(
+        x=list(result.x_unit),
+        y=float(result.y),
+        metadata=dict(result.metadata),
+    )
+    if previous_has_feasible:
+        current = _observation_objective(result_observation)
+        tolerance = max(1e-8, 0.001 * max(abs(previous), 1.0))
+        improved = bool(result.metadata.get("feasible", False)) and current < previous - tolerance
+        best = min(previous, current) if bool(result.metadata.get("feasible", False)) else previous
+        return improved, current, best
+
+    current = _observation_constraint_ratio(result_observation, failure_ratio=1.0e6)
+    tolerance = max(1e-8, 0.001 * max(abs(previous), 1.0))
+    return current < previous - tolerance, current, min(previous, current)
 
 
 def _validate_state(state: OptimizerState) -> None:
@@ -832,10 +1154,21 @@ def _build_strategy_candidate_options(
     hypothesis_alignment_weight: float = 0.0,
     information_gain_weight: float = 0.35,
     world_model_entropy: float = 1.0,
+    constraint_surrogate: Any | None = None,
+    has_feasible_observation: bool = True,
+    feasibility_floor: float = 0.05,
+    best_x: np.ndarray | None = None,
+    feasible_x: np.ndarray | None = None,
 ) -> list[dict[str, object]]:
     """Build scored candidate options grouped by WMBO strategy."""
 
-    best = observed_x[int(np.argmin(observed_y))] if len(observed_y) else np.full(dim, 0.5)
+    best = (
+        np.asarray(best_x, dtype=float)
+        if best_x is not None
+        else observed_x[int(np.argmin(observed_y))]
+        if len(observed_y)
+        else np.full(dim, 0.5)
+    )
     hypotheses = [
         hypothesis
         for hypothesis in (active_hypotheses or [])
@@ -857,7 +1190,16 @@ def _build_strategy_candidate_options(
                 dim=dim,
                 n_points=n_pool,
                 seed=option_seed,
+                best_x=best,
+                constrained=constraint_surrogate is not None,
             )
+            if feasible_x is not None and len(feasible_x):
+                pool = _augment_pool_with_feasible_neighbourhood(
+                    pool,
+                    feasible_x=feasible_x,
+                    center=best,
+                    seed=option_seed + 500_000,
+                )
             pool = _augment_pool_with_hypothesis_tests(
                 pool,
                 hypotheses=hypotheses,
@@ -866,6 +1208,15 @@ def _build_strategy_candidate_options(
                 seed=option_seed + 1_000_000,
             )
             prediction = surrogate.predict(pool)
+            feasibility_probability = None
+            constraint_mean = None
+            constraint_std = None
+            if constraint_surrogate is not None:
+                feasibility_probability, constraint_mean, constraint_std = _predict_feasibility(
+                    constraint_surrogate,
+                    pool,
+                    feasible_x=feasible_x,
+                )
             acquisition_input = AcquisitionInput(
                 candidates=pool,
                 observed_x=observed_x.tolist(),
@@ -873,16 +1224,42 @@ def _build_strategy_candidate_options(
                 surrogate_mean=prediction.mean,
                 surrogate_std=prediction.std,
                 strategy=acquisition_strategy,
+                feasibility_probability=feasibility_probability,
+                constraint_std=constraint_std,
+                has_feasible_observation=has_feasible_observation,
+                feasibility_floor=feasibility_floor,
             )
             strategy_scores = np.asarray(score_candidates(acquisition_input), dtype=float)
             best_y = float(np.min(observed_y)) if len(observed_y) else 0.0
-            ei_scores = np.asarray(
-                expected_improvement(prediction.mean, prediction.std, best_y=best_y, xi=0.001),
+            raw_ei_scores = np.asarray(
+                expected_improvement(
+                    prediction.mean,
+                    prediction.std,
+                    best_y=best_y,
+                    xi=0.001,
+                ),
+                dtype=float,
+            )
+            constrained_ei_scores = np.asarray(
+                score_candidates(
+                    AcquisitionInput(
+                        candidates=pool,
+                        observed_x=observed_x.tolist(),
+                        observed_y=observed_y.tolist(),
+                        surrogate_mean=prediction.mean,
+                        surrogate_std=prediction.std,
+                        strategy="exploit_ei",
+                        feasibility_probability=feasibility_probability,
+                        constraint_std=constraint_std,
+                        has_feasible_observation=has_feasible_observation,
+                        feasibility_floor=feasibility_floor,
+                    )
+                ),
                 dtype=float,
             )
             optimisation_utility = (
                 0.65 * _scale_candidates_01(strategy_scores)
-                + 0.35 * _scale_candidates_01(ei_scores)
+                + 0.35 * _scale_candidates_01(constrained_ei_scores)
             )
             information, confirmation, falsification, confirm_targets, falsify_targets = (
                 _candidate_information_values(
@@ -929,7 +1306,8 @@ def _build_strategy_candidate_options(
                     "x_unit": x,
                     "acquisition_strategy": acquisition_strategy,
                     "acquisition_score": score,
-                    "expected_improvement": float(ei_scores[selected_index]),
+                    "expected_improvement": float(raw_ei_scores[selected_index]),
+                    "constrained_expected_improvement": float(constrained_ei_scores[selected_index]),
                     "optimisation_utility": float(optimisation_utility[selected_index]),
                     "information_gain": float(information[selected_index]),
                     "confirmation_value": float(confirmation[selected_index]),
@@ -941,6 +1319,21 @@ def _build_strategy_candidate_options(
                     "hypothesis_alignment": alignment,
                     "surrogate_mean": float(prediction.mean[selected_index]),
                     "surrogate_std": float(prediction.std[selected_index]),
+                    "predicted_feasibility_probability": (
+                        float(feasibility_probability[selected_index])
+                        if feasibility_probability is not None
+                        else None
+                    ),
+                    "predicted_constraint_log_ratio": (
+                        float(constraint_mean[selected_index])
+                        if constraint_mean is not None
+                        else None
+                    ),
+                    "constraint_std": (
+                        float(constraint_std[selected_index])
+                        if constraint_std is not None
+                        else None
+                    ),
                     "distance_to_best": float(np.linalg.norm(np.asarray(x, dtype=float) - best)),
                     "distance_to_nearest_observation": _distance_to_nearest_observation(x, observed_x),
                 }
@@ -1186,12 +1579,25 @@ def _verify_candidate_with_gp(
         "decision_confidence": float(decision_confidence),
         "original_acquisition_score": _candidate_acquisition_score(selected),
         "original_surrogate_std": _candidate_float(selected, "surrogate_std"),
+        "original_feasibility_probability": _candidate_float(
+            selected,
+            "predicted_feasibility_probability",
+            default=1.0,
+        ),
     }
     evidence_role = str(selected.get("evidence_role", "optimize"))
     targeted_information_test = bool(
         evidence_role in {"confirm", "falsify"} and selected.get("target_hypothesis_id")
     )
-    if targeted_information_test:
+    selected_probability = _candidate_float(
+        selected,
+        "predicted_feasibility_probability",
+        default=1.0,
+    )
+    min_probability = float(
+        np.clip(config.gp_verifier_min_feasibility_probability, 0.0, 1.0)
+    )
+    if targeted_information_test and selected_probability >= min_probability:
         metadata["action"] = "accepted_information_test"
         metadata["evidence_role"] = evidence_role
         metadata["target_hypothesis_id"] = selected.get("target_hypothesis_id")
@@ -1207,7 +1613,29 @@ def _verify_candidate_with_gp(
 
     refined = selected
     reason: str | None = None
-    if confidence < 0.85 and _score_is_much_worse(selected_score, best_score, min_ratio):
+    best_by_feasibility = max(
+        matching,
+        key=lambda candidate: (
+            _candidate_float(
+                candidate,
+                "predicted_feasibility_probability",
+                default=1.0,
+            ),
+            _candidate_acquisition_score(candidate),
+        ),
+    )
+    best_probability = _candidate_float(
+        best_by_feasibility,
+        "predicted_feasibility_probability",
+        default=1.0,
+    )
+    if (
+        selected_probability < min_probability
+        and best_probability > selected_probability + 0.05
+    ):
+        refined = best_by_feasibility
+        reason = "gp_refined_low_feasibility_probability"
+    elif confidence < 0.85 and _score_is_much_worse(selected_score, best_score, min_ratio):
         refined = best_by_acquisition
         reason = "gp_refined_low_acquisition_score"
     elif _candidate_float(selected, "distance_to_nearest_observation") < float(config.gp_verifier_duplicate_distance):
@@ -1243,6 +1671,12 @@ def _verify_candidate_with_gp(
             "verified_candidate_id": str(refined.get("candidate_id")),
             "verified_acquisition_score": _candidate_acquisition_score(refined),
             "verified_surrogate_std": _candidate_float(refined, "surrogate_std"),
+            "best_feasibility_probability": best_probability,
+            "verified_feasibility_probability": _candidate_float(
+                refined,
+                "predicted_feasibility_probability",
+                default=1.0,
+            ),
         }
     )
     if reason is None or refined is selected:
@@ -1403,12 +1837,20 @@ def _make_wmbo_candidate_pool(
     dim: int,
     n_points: int,
     seed: int,
+    best_x: np.ndarray | None = None,
+    constrained: bool = False,
 ) -> list[list[float]]:
     rng = np.random.default_rng(seed)
     key = strategy.strip().lower().replace("-", "_")
     if key == "trust_region" and len(observed_x):
-        best = observed_x[int(np.argmin(observed_y))]
+        best = (
+            np.asarray(best_x, dtype=float)
+            if best_x is not None
+            else observed_x[int(np.argmin(observed_y))]
+        )
         radius = max(0.04, 0.25 * (0.97 ** len(observed_y)))
+        if constrained:
+            radius = min(radius, 0.10)
         local_count = max(1, int(0.8 * n_points))
         global_count = max(0, n_points - local_count)
         local = best + rng.normal(0.0, radius, size=(local_count, dim))
@@ -1421,6 +1863,40 @@ def _make_wmbo_candidate_pool(
         return pool.astype(float).tolist()
 
     return sample_unit_points(n_points=n_points, dim=dim, seed=seed)
+
+
+def _augment_pool_with_feasible_neighbourhood(
+    pool: Sequence[Sequence[float]],
+    *,
+    feasible_x: np.ndarray,
+    center: np.ndarray,
+    seed: int,
+) -> list[list[float]]:
+    """Reserve half of a candidate pool for strict-feasible neighbourhood search."""
+
+    candidate_array = np.asarray(pool, dtype=float)
+    if candidate_array.ndim != 2 or not len(candidate_array):
+        return candidate_array.astype(float).tolist()
+    feasible_array = np.asarray(feasible_x, dtype=float)
+    if feasible_array.ndim != 2 or not len(feasible_array):
+        return candidate_array.astype(float).tolist()
+
+    rng = np.random.default_rng(seed)
+    local_count = max(1, len(candidate_array) // 2)
+    tight_count = max(1, (2 * local_count) // 3)
+    broad_count = local_count - tight_count
+    local_parts = [
+        np.asarray(center, dtype=float)[None, :]
+        + rng.normal(0.0, 0.015, size=(tight_count, candidate_array.shape[1]))
+    ]
+    if broad_count:
+        anchors = feasible_array[rng.integers(0, len(feasible_array), size=broad_count)]
+        local_parts.append(
+            anchors + rng.normal(0.0, 0.05, size=(broad_count, candidate_array.shape[1]))
+        )
+    local = np.clip(np.vstack(local_parts), 0.0, 1.0)
+    retained = candidate_array[: len(candidate_array) - local_count]
+    return np.vstack([local, retained]).astype(float).tolist()
 
 
 __all__ = [

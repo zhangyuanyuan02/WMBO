@@ -24,6 +24,10 @@ class AcquisitionInput:
         surrogate_mean: Predicted objective mean for each candidate.
         surrogate_std: Predicted uncertainty for each candidate.
         strategy: Acquisition strategy name.
+        feasibility_probability: Optional probability of strict feasibility per candidate.
+        constraint_std: Optional constraint-model uncertainty per candidate.
+        has_feasible_observation: Whether the run already contains a feasible point.
+        feasibility_floor: Exploration floor used outside pure exploitation.
 
     Output:
         Passed to an acquisition function to produce ``AcquisitionResult``.
@@ -35,6 +39,10 @@ class AcquisitionInput:
     surrogate_mean: Sequence[float]
     surrogate_std: Sequence[float]
     strategy: str = "expected_improvement"
+    feasibility_probability: Sequence[float] | None = None
+    constraint_std: Sequence[float] | None = None
+    has_feasible_observation: bool = True
+    feasibility_floor: float = 0.05
 
 
 @dataclass(frozen=True)
@@ -175,28 +183,35 @@ def score_candidates(acquisition_input: AcquisitionInput) -> list[float]:
     strategy = _normalise_strategy(acquisition_input.strategy)
 
     if strategy == "expected_improvement":
-        return expected_improvement(mean, std, best_y=best_y, xi=0.01)
-    if strategy == "exploit_ei":
-        return expected_improvement(mean, std, best_y=best_y, xi=0.001)
-    if strategy == "probability_improvement":
-        return probability_improvement(mean, std, best_y=best_y, xi=0.01)
-    if strategy == "lower_confidence_bound":
-        return lower_confidence_bound(mean, std, kappa=2.0)
-    if strategy == "explore_ucb":
-        return lower_confidence_bound(mean, std, kappa=3.0)
-    if strategy == "uncertainty":
-        return std.tolist()
-    if strategy == "diversity":
-        return diversity_score(candidates, acquisition_input.observed_x)
-    if strategy == "global_diverse":
+        base_scores = expected_improvement(mean, std, best_y=best_y, xi=0.01)
+    elif strategy == "exploit_ei":
+        base_scores = expected_improvement(mean, std, best_y=best_y, xi=0.001)
+    elif strategy == "probability_improvement":
+        base_scores = probability_improvement(mean, std, best_y=best_y, xi=0.01)
+    elif strategy == "lower_confidence_bound":
+        base_scores = lower_confidence_bound(mean, std, kappa=2.0)
+    elif strategy == "explore_ucb":
+        base_scores = lower_confidence_bound(mean, std, kappa=3.0)
+    elif strategy == "uncertainty":
+        base_scores = std.tolist()
+    elif strategy == "diversity":
+        base_scores = diversity_score(candidates, acquisition_input.observed_x)
+    elif strategy == "global_diverse":
         uncertainty = _scale_01(std)
         diversity = _scale_01(np.asarray(diversity_score(candidates, acquisition_input.observed_x), dtype=float))
-        return (0.55 * uncertainty + 0.45 * diversity).tolist()
-    if strategy == "random":
+        base_scores = (0.55 * uncertainty + 0.45 * diversity).tolist()
+    elif strategy == "random":
         rng = random.Random(0)
-        return [rng.random() for _ in range(len(candidates))]
+        base_scores = [rng.random() for _ in range(len(candidates))]
+    else:
+        raise ValueError(f"Unknown acquisition strategy: {acquisition_input.strategy}")
 
-    raise ValueError(f"Unknown acquisition strategy: {acquisition_input.strategy}")
+    return _apply_feasibility_scores(
+        base_scores,
+        acquisition_input=acquisition_input,
+        strategy=strategy,
+        expected_length=len(candidates),
+    )
 
 
 def select_next_candidate(acquisition_input: AcquisitionInput) -> AcquisitionResult:
@@ -244,6 +259,45 @@ def _normal_pdf(z: np.ndarray) -> np.ndarray:
 def _normal_cdf(z: np.ndarray) -> np.ndarray:
     erf = np.vectorize(math.erf)
     return 0.5 * (1.0 + erf(z / math.sqrt(2.0)))
+
+
+def _apply_feasibility_scores(
+    base_scores: Sequence[float],
+    *,
+    acquisition_input: AcquisitionInput,
+    strategy: str,
+    expected_length: int,
+) -> list[float]:
+    """Combine objective acquisition with predicted strict-feasibility probability."""
+
+    if acquisition_input.feasibility_probability is None:
+        return [float(value) for value in base_scores]
+
+    probability = _as_1d_array(
+        acquisition_input.feasibility_probability,
+        name="feasibility_probability",
+    )
+    if len(probability) != expected_length:
+        raise ValueError("Feasibility probabilities must match the candidate pool.")
+    probability = np.clip(probability, 0.0, 1.0)
+
+    if not acquisition_input.has_feasible_observation:
+        uncertainty = np.zeros(expected_length, dtype=float)
+        if acquisition_input.constraint_std is not None:
+            uncertainty = _scale_01(
+                _as_1d_array(acquisition_input.constraint_std, name="constraint_std")
+            )
+            if len(uncertainty) != expected_length:
+                raise ValueError("Constraint uncertainties must match the candidate pool.")
+        return (probability + 0.10 * uncertainty).tolist()
+
+    base = _scale_01(np.asarray(base_scores, dtype=float))
+    floor = float(np.clip(acquisition_input.feasibility_floor, 0.0, 1.0))
+    if strategy in {"uncertainty", "diversity", "global_diverse", "explore_ucb", "random"}:
+        feasibility_weight = floor + (1.0 - floor) * probability
+    else:
+        feasibility_weight = probability
+    return (base * feasibility_weight).tolist()
 
 
 def _scale_01(values: np.ndarray) -> np.ndarray:

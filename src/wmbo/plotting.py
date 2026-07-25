@@ -92,7 +92,7 @@ def plot_summary_table(summary: Sequence[Mapping[str, object]], output_path: str
     output = Path(output_path)
     ensure_dir(output.parent)
 
-    headers = ["benchmark", "method", "seed", "final_best", "final_regret"]
+    headers = ["benchmark", "method", "seed", "primary_score", "feasibility_rate"]
     table_rows = []
     for row in rows:
         table_rows.append(
@@ -100,8 +100,8 @@ def plot_summary_table(summary: Sequence[Mapping[str, object]], output_path: str
                 str(row.get("benchmark_name", row.get("benchmark", ""))),
                 str(row.get("method", "")),
                 str(row.get("seed", "")),
-                _format_float(row.get("final_best")),
-                _format_float(row.get("final_regret")),
+                _format_float(row.get("primary_score", row.get("final_best"))),
+                _format_float(row.get("feasibility_rate")),
             ]
         )
 
@@ -211,7 +211,7 @@ def plot_convergence_from_observations(
 def plot_final_metric_from_summary(
     summary: Sequence[Mapping[str, object]],
     output_path: str | Path,
-    metric: str = "final_best",
+    metric: str = "primary_score",
     title: str | None = None,
 ) -> Path:
     """Plot mean final metric by method from suite summary rows.
@@ -275,7 +275,18 @@ def plot_results_directory(results_dir: str | Path, output_dir: str | Path | Non
     summary_path = root / "summary.csv"
     if summary_path.exists():
         summary = load_summary_csv(summary_path)
-        generated.append(plot_final_metric_from_summary(summary, figure_dir / "final_best.png", metric="final_best"))
+        primary_metric = (
+            "primary_score"
+            if any(_optional_float(row.get("primary_score")) is not None for row in summary)
+            else "final_best"
+        )
+        generated.append(
+            plot_final_metric_from_summary(
+                summary,
+                figure_dir / f"{primary_metric}.png",
+                metric=primary_metric,
+            )
+        )
         if any(_optional_float(row.get("final_regret")) is not None for row in summary):
             generated.append(plot_final_metric_from_summary(summary, figure_dir / "final_regret.png", metric="final_regret"))
         generated.append(plot_summary_table(summary, figure_dir / "summary_table.png"))
@@ -287,12 +298,17 @@ def plot_results_directory(results_dir: str | Path, output_dir: str | Path | Non
             benchmark_rows[benchmark].append(row)
 
     for benchmark, rows in sorted(benchmark_rows.items()):
+        curve_metric = (
+            "primary_best"
+            if any(_optional_float(row.get("primary_best")) is not None for row in rows)
+            else "best_y"
+        )
         generated.append(
             plot_convergence_from_observations(
                 rows,
-                figure_dir / f"{benchmark}_best_y.png",
-                metric="best_y",
-                title=f"{benchmark}: best objective value so far",
+                figure_dir / f"{benchmark}_{curve_metric}.png",
+                metric=curve_metric,
+                title=f"{benchmark}: {curve_metric.replace('_', ' ')}",
             )
         )
         if any(_optional_float(row.get("simple_regret")) is not None for row in rows):
@@ -369,7 +385,17 @@ def _coerce_row(row: Mapping[str, object]) -> dict[str, object]:
             coerced[str(key)] = None
         elif key in {"step", "seed", "num_evaluations"}:
             coerced[str(key)] = _optional_int(text)
-        elif key in {"y", "best_y", "simple_regret", "final_best", "final_regret"}:
+        elif key in {
+            "y",
+            "best_y",
+            "primary_best",
+            "simple_regret",
+            "final_best",
+            "final_regret",
+            "primary_score",
+            "feasibility_rate",
+            "near_feasible_rate_10x",
+        }:
             coerced[str(key)] = _optional_float(text)
         else:
             coerced[str(key)] = value
@@ -407,6 +433,7 @@ def _metric_label(metric: str) -> str:
         "simple_regret": "Simple regret",
         "final_best": "Mean final best objective value",
         "final_regret": "Mean final regret",
+        "primary_score": "Mean best feasible normalised cost gap",
     }
     return labels.get(metric, metric.replace("_", " ").title())
 

@@ -134,6 +134,7 @@ class WMBOControlConfig:
     gp_verifier_enabled: bool = True
     gp_verifier_min_score_ratio: float = 0.75
     gp_verifier_duplicate_distance: float = 1e-4
+    gp_verifier_min_feasibility_probability: float = 0.10
 
 
 @dataclass

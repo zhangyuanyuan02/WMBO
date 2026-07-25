@@ -152,11 +152,19 @@ def main() -> None:
     print("completed benchmark runs:")
     for result in results:
         summary = asdict(result.summary)
+        metadata = summary.get("metadata", {})
+        primary_score = (
+            metadata.get("primary_score")
+            if isinstance(metadata, dict)
+            else None
+        )
         print(
-            "- {benchmark_name} | {method} | seed={seed} | best={final_best:.6g} | n={num_evaluations}".format(
+            "- {benchmark_name} | {method} | seed={seed} | primary={primary_score:.6g} "
+            "| legacy_best={final_best:.6g} | n={num_evaluations}".format(
                 benchmark_name=summary["benchmark_name"],
                 method=summary["method"],
                 seed=summary["seed"],
+                primary_score=primary_score if primary_score is not None else float("nan"),
                 final_best=summary["final_best"] if summary["final_best"] is not None else float("nan"),
                 num_evaluations=summary["num_evaluations"],
             )

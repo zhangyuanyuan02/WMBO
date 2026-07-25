@@ -4,27 +4,43 @@
   "source": "https://github.com/power-grid-lib/pglib-opf/tree/v23.07",
   "license_file": "LICENSE",
   "benchmarks": {
-    "opf_pglib_case14_typ_pg": {
+    "opf_pglib_case14_typ_pgvg": {
       "scenario_id": "pglib_opf_case14_ieee",
       "variant": "typ",
       "case_file": "pglib_opf_case14_ieee.m",
       "sha256": "bd5c568621de65e4b0922317010868bc7fa94173807faa10ea8fdbbe77c28106",
-      "control_mode": "non_slack_active_pg",
-      "controllable_generator_ids": ["2"],
-      "bounds_mw": [[0.0, 59.0]],
-      "recommended_start_mw": [29.5],
-      "reference_cost": 2178.0804108368666
+      "control_mode": "non_slack_active_pg_and_generator_bus_vg",
+      "variables": [
+        {"name": "Pg2", "kind": "pg", "component_id": "2", "bus_id": "2", "unit": "MW", "lower": 0.0, "upper": 59.0},
+        {"name": "Vg1", "kind": "vg", "component_id": "1", "bus_id": "1", "unit": "p.u.", "lower": 0.94, "upper": 1.06},
+        {"name": "Vg2", "kind": "vg", "component_id": "2", "bus_id": "2", "unit": "p.u.", "lower": 0.94, "upper": 1.06},
+        {"name": "Vg3", "kind": "vg", "component_id": "3", "bus_id": "3", "unit": "p.u.", "lower": 0.94, "upper": 1.06},
+        {"name": "Vg6", "kind": "vg", "component_id": "6", "bus_id": "6", "unit": "p.u.", "lower": 0.94, "upper": 1.06},
+        {"name": "Vg8", "kind": "vg", "component_id": "8", "bus_id": "8", "unit": "p.u.", "lower": 0.94, "upper": 1.06}
+      ],
+      "bounds": [[0.0, 59.0], [0.94, 1.06], [0.94, 1.06], [0.94, 1.06], [0.94, 1.06], [0.94, 1.06]],
+      "recommended_start": [59.0, 1.06, 1.0397082538421072, 1.007490625431771, 1.06, 1.06],
+      "reference_cost": 2178.080410819643,
+      "reference_kind": "full_ac_opf_pg_vg"
     },
-    "opf_pglib_case14_api_pg": {
+    "opf_pglib_case14_api_pgvg": {
       "scenario_id": "pglib_opf_case14_ieee__api",
       "variant": "api",
       "case_file": "api/pglib_opf_case14_ieee__api.m",
       "sha256": "6e007be95df3f7171d0c9494c8cc3db1aca1a3a0f2073c3ffbfa43e7b0cd49a2",
-      "control_mode": "non_slack_active_pg",
-      "controllable_generator_ids": ["2"],
-      "bounds_mw": [[0.0, 230.0]],
-      "recommended_start_mw": [130.3011702003637],
-      "reference_cost": 5999.363080435895
+      "control_mode": "non_slack_active_pg_and_generator_bus_vg",
+      "variables": [
+        {"name": "Pg2", "kind": "pg", "component_id": "2", "bus_id": "2", "unit": "MW", "lower": 0.0, "upper": 230.0},
+        {"name": "Vg1", "kind": "vg", "component_id": "1", "bus_id": "1", "unit": "p.u.", "lower": 0.94, "upper": 1.06},
+        {"name": "Vg2", "kind": "vg", "component_id": "2", "bus_id": "2", "unit": "p.u.", "lower": 0.94, "upper": 1.06},
+        {"name": "Vg3", "kind": "vg", "component_id": "3", "bus_id": "3", "unit": "p.u.", "lower": 0.94, "upper": 1.06},
+        {"name": "Vg6", "kind": "vg", "component_id": "6", "bus_id": "6", "unit": "p.u.", "lower": 0.94, "upper": 1.06},
+        {"name": "Vg8", "kind": "vg", "component_id": "8", "bus_id": "8", "unit": "p.u.", "lower": 0.94, "upper": 1.06}
+      ],
+      "bounds": [[0.0, 230.0], [0.94, 1.06], [0.94, 1.06], [0.94, 1.06], [0.94, 1.06], [0.94, 1.06]],
+      "recommended_start": [172.49999999999997, 1.06, 0.9967497935513996, 0.94, 1.06, 1.06],
+      "reference_cost": 5999.363080387212,
+      "reference_kind": "full_ac_opf_pg_vg"
     }
   }
 }

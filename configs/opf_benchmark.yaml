@@ -8,12 +8,15 @@ experiment:
 
 benchmark_suite:
   benchmarks:
-    - opf_pglib_case14_typ_pg
-    - opf_pglib_case14_api_pg
+    - opf_pglib_case14_typ_pgvg
+    - opf_pglib_case14_api_pgvg
 
 optimizer:
   options:
     surrogate: gaussian_process
+    constraint_handling: auto
+    constraint_pof_floor: 0.05
+    constraint_failure_ratio: 1000000.0
 
 evaluation:
   opf:
@@ -27,7 +30,9 @@ evaluation:
       warmup: true
 
 llm:
-  enabled: false
+  enabled: true
+  provider: siliconflow
+  fallback_to_rule: true
 
 logging:
   verbose: true

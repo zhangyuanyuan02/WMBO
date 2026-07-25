@@ -136,7 +136,7 @@ class PersistentJuliaOPFBackend:
         threading.Thread(target=self._read_stdout, name="wmbo-opf-stdout", daemon=True).start()
         threading.Thread(target=self._read_stderr, name="wmbo-opf-stderr", daemon=True).start()
         self._exchange(
-            {"action": "describe", "benchmark": "opf_pglib_case14_typ_pg"},
+            {"action": "describe", "benchmark": "opf_pglib_case14_typ_pgvg"},
             timeout=self.config.startup_timeout_seconds,
         )
         if self.config.warmup:
@@ -223,10 +223,10 @@ _BACKENDS_LOCK = threading.Lock()
 
 def evaluate_opf(
     benchmark_name: str,
-    pg_mw: Sequence[float],
+    control_values: Sequence[float],
     options: Mapping[str, object] | None = None,
 ) -> tuple[float, dict[str, object]]:
-    """Evaluate one fixed-``Pg`` AC power-flow candidate and scalarise its diagnostics."""
+    """Evaluate one fixed-``Pg+Vg`` AC power-flow candidate and scalarise its diagnostics."""
 
     evaluation_options = dict(options or {})
     backend_options = _mapping(evaluation_options.get("backend", evaluation_options))
@@ -239,7 +239,13 @@ def evaluate_opf(
     penalty_weight = float(evaluation_options.get("penalty_weight", 100.0))
     failure_penalty = float(evaluation_options.get("failure_penalty", 1.0e6))
     feasibility_tolerance = float(evaluation_options.get("feasibility_tolerance", 1.0e-5))
-    if penalty_weight < 0.0 or failure_penalty <= 0.0 or feasibility_tolerance < 0.0:
+    constraint_failure_ratio = float(evaluation_options.get("constraint_failure_ratio", 1.0e6))
+    if (
+        penalty_weight < 0.0
+        or failure_penalty <= 0.0
+        or feasibility_tolerance <= 0.0
+        or constraint_failure_ratio <= 1.0
+    ):
         raise ValueError("Invalid OPF scalarisation options.")
 
     result = dict(
@@ -247,7 +253,7 @@ def evaluate_opf(
             {
                 "action": "evaluate",
                 "benchmark": benchmark_name,
-                "pg_mw": [float(value) for value in pg_mw],
+                "control_values": [float(value) for value in control_values],
                 "feasibility_tolerance": feasibility_tolerance,
             }
         )
@@ -256,18 +262,29 @@ def evaluate_opf(
     generation_cost = _optional_float(result.get("generation_cost"))
     reference_cost = _optional_float(result.get("reference_cost"))
     total_violation = max(0.0, float(result.get("total_violation", 1.0)))
+    max_normalized_violation = max(0.0, float(result.get("max_normalized_violation", 1.0)))
     if not converged or generation_cost is None or reference_cost is None:
         score = failure_penalty
+        legacy_penalised_score = failure_penalty
         normalised_cost_gap = None
+        constraint_ratio = constraint_failure_ratio
+        constraint_excess = constraint_failure_ratio - 1.0
     else:
         normalised_cost_gap = max(0.0, (generation_cost - reference_cost) / max(abs(reference_cost), 1.0))
-        score = normalised_cost_gap + penalty_weight * total_violation
+        constraint_ratio = max_normalized_violation / feasibility_tolerance
+        constraint_excess = max(0.0, constraint_ratio - 1.0)
+        legacy_penalised_score = normalised_cost_gap + penalty_weight * total_violation
+        score = normalised_cost_gap + penalty_weight * constraint_excess * constraint_excess
     result.update(
         {
             "normalised_cost_gap": normalised_cost_gap,
             "penalty_weight": penalty_weight,
             "failure_penalty": failure_penalty,
-            "score_kind": "normalised_cost_gap_plus_constraint_penalty",
+            "feasibility_tolerance": feasibility_tolerance,
+            "constraint_ratio": constraint_ratio,
+            "constraint_excess": constraint_excess,
+            "legacy_penalised_score": legacy_penalised_score,
+            "score_kind": "normalised_cost_gap_plus_tolerance_scaled_excess_penalty",
         }
     )
     return float(score), result

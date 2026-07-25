@@ -84,7 +84,7 @@ This writes figures under `results/debug/figures/`.
 
 ## OPF benchmark
 
-The first OPF release vendors the PGLib-OPF v23.07 IEEE case14 TYP and API cases. Only non-slack generators with a non-zero active-power range become variables; case14 therefore has one `Pg` variable because its other three non-slack generator records are synchronous condensers with `Pmin=Pmax=0`.
+The OPF benchmark vendors the PGLib-OPF v23.07 IEEE case14 TYP and API cases. Each benchmark has six controls in a fixed order: active power `Pg2` for the one dispatchable non-slack generator, followed by voltage setpoints `Vg1`, `Vg2`, `Vg3`, `Vg6`, and `Vg8` for all online generator buses, including the slack bus.
 
 Install Julia 1.10 LTS with Juliaup, then resolve the pinned PowerModels 0.19.9 and Ipopt 1.4.1 environment:
 
@@ -106,7 +106,7 @@ python run_benchmark.py --config configs/opf_debug.yaml
 python run_benchmark.py --config configs/opf_benchmark.yaml
 ```
 
-Every method receives the same pinned first point. TYP uses the feasible PGLib base dispatch (`Pg=29.5 MW`); API uses its feasible restricted reference because the PGLib base dispatch violates constraints at the strict `1e-5` tolerance. This also means the API `Pg`-only feasible region is very narrow, a documented v1 limitation motivating a later `Pg+Vg` benchmark. Subsequent candidates run AC power flow only. Each observation records cost, reference cost, feasibility, convergence, violations, and timing. The scalar target is `normalised_cost_gap + 100 * total_violation`; a non-converged power flow receives `1e6`.
+Every method receives the same pinned, strictly feasible, suboptimal first point. The checked-in starts were generated deterministically with `julia/generate_pgvg_starts.jl` and have reference-cost gaps of about 40.32% for TYP and 10.75% for API. A full AC-OPF is solved once to obtain the reference cost and controls; optimisation candidates set `Pg+Vg` and run AC power flow only. Each observation records the controls, cost, reference cost, feasibility, convergence, violations, and timing. Constrained optimisers model the normalised cost gap and the log constraint ratio separately, then combine objective acquisition with predicted probability of feasibility. The diagnostic scalar target is `normalised_cost_gap + penalty_weight * max(0, max_normalized_violation / feasibility_tolerance - 1)^2`; a non-converged power flow receives `1e6`. OPF comparisons rank methods by `primary_score` (best strictly feasible gap), with the legacy penalised best retained for historical analysis.
 
 Run the optional real Julia integration tests after setup:
 

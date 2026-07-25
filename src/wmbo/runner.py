@@ -109,6 +109,25 @@ def run_single_benchmark(request: BenchmarkRunRequest) -> BenchmarkRunResult:
         regret_curve = simple_regret(best_curve, benchmark.optimum_value)
         optimiser_metadata = _extract_observation_metadata(state.metadata)
         evaluation_metadata = dict(result.metadata)
+        feasible_gaps = [
+            gap
+            for gap in (
+                _finite_float(item.get("normalised_cost_gap"))
+                for item in observations
+                if bool(item.get("feasible", False))
+            )
+            if gap is not None
+        ]
+        current_gap = _finite_float(evaluation_metadata.get("normalised_cost_gap"))
+        if bool(evaluation_metadata.get("feasible", False)) and current_gap is not None:
+            feasible_gaps.append(current_gap)
+        primary_best = (
+            min(feasible_gaps)
+            if benchmark.constrained and feasible_gaps
+            else None
+            if benchmark.constrained
+            else best_curve[-1]
+        )
         observation = {
             "step": step,
             "benchmark": benchmark.name,
@@ -118,6 +137,7 @@ def run_single_benchmark(request: BenchmarkRunRequest) -> BenchmarkRunResult:
             "x_raw": [float(value) for value in result.x_raw],
             "y": float(result.y),
             "best_y": best_curve[-1],
+            "primary_best": primary_best,
             "simple_regret": regret_curve[-1],
             **evaluation_metadata,
             **optimiser_metadata,
@@ -154,8 +174,10 @@ def run_single_benchmark(request: BenchmarkRunRequest) -> BenchmarkRunResult:
     if request.output_dir:
         save_run_result(result, request.output_dir)
     if log_enabled:
+        primary_score = summary.metadata.get("primary_score")
         _log(
-            f"{run_label} done final_best={_format_number(summary.final_best)} "
+            f"{run_label} done primary_score={_format_number(primary_score)} "
+            f"final_best={_format_number(summary.final_best)} "
             f"final_regret={_format_number(summary.final_regret)} output={request.output_dir or '<memory>'}"
         )
     return result
@@ -254,6 +276,9 @@ def save_suite_summary(results: Sequence[BenchmarkRunResult], output_dir: str) -
     rows = [_summary_to_dict(result.summary) for result in results]
     write_json(directory / "summary.json", rows)
     _write_summary_csv(directory / "summary.csv", rows)
+    aggregate_rows = _aggregate_summary_rows(rows)
+    write_json(directory / "aggregate_summary.json", aggregate_rows)
+    _write_aggregate_summary_csv(directory / "aggregate_summary.csv", aggregate_rows)
 
 
 def _make_optimizer_config(request: BenchmarkRunRequest) -> OptimizerConfig:
@@ -300,16 +325,25 @@ def _write_observations_csv(path: Path, observations: Sequence[Mapping[str, obje
         "x_raw",
         "y",
         "best_y",
+        "primary_best",
         "simple_regret",
         "family",
         "constrained",
         "generation_cost",
+        "control_names",
+        "control_values",
+        "pg_mw",
+        "vg_pu",
         "reference_cost",
         "normalised_cost_gap",
         "feasible",
         "pf_converged",
         "total_violation",
         "max_normalized_violation",
+        "feasibility_tolerance",
+        "constraint_ratio",
+        "constraint_excess",
+        "legacy_penalised_score",
         "max_voltage_violation",
         "max_thermal_violation",
         "max_angle_violation",
@@ -354,6 +388,9 @@ def _write_observations_csv(path: Path, observations: Sequence[Mapping[str, obje
         "joint_score",
         "expected_improvement",
         "information_gain",
+        "predicted_feasibility_probability",
+        "predicted_constraint_log_ratio",
+        "constraint_std",
         "candidate_override",
         "gp_verifier_action",
         "gp_verifier_reason",
@@ -365,6 +402,10 @@ def _write_observations_csv(path: Path, observations: Sequence[Mapping[str, obje
         for observation in observations:
             row = dict(observation)
             row["x_unit"] = _format_vector(row.get("x_unit"))
+            row["control_names"] = _format_vector(row.get("control_names"), numeric=False)
+            row["control_values"] = _format_vector(row.get("control_values"))
+            row["pg_mw"] = _format_vector(row.get("pg_mw"))
+            row["vg_pu"] = _format_vector(row.get("vg_pu"))
             row["x_raw"] = _format_vector(row.get("x_raw"))
             row["hypothesis_region_center"] = _format_vector(row.get("hypothesis_region_center"))
             row["hypothesis_sensitive_dims"] = _format_vector(row.get("hypothesis_sensitive_dims"))
@@ -377,8 +418,32 @@ def _write_summary_csv(path: Path, rows: Sequence[Mapping[str, object]]) -> None
     ensure_dir(path.parent)
     fieldnames = [
         "benchmark_name", "method", "seed", "final_best", "final_regret", "num_evaluations",
+        "primary_score", "feasible_improvement_found", "evals_to_first_feasible_improvement",
         "best_feasible_cost", "best_feasible_gap", "feasibility_rate", "evals_to_first_feasible",
-        "min_total_violation", "pf_failure_rate", "total_evaluation_time", "anytime_feasible_gap_auc",
+        "feasible_evaluations", "min_total_violation", "min_max_normalized_violation",
+        "near_feasible_rate_10x", "pf_failure_rate", "total_evaluation_time",
+        "anytime_feasible_gap_auc",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({name: row.get(name) for name in fieldnames})
+
+
+def _write_aggregate_summary_csv(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
+    ensure_dir(path.parent)
+    fieldnames = [
+        "benchmark_name",
+        "method",
+        "runs",
+        "primary_score_median",
+        "primary_score_q1",
+        "primary_score_q3",
+        "feasible_improvement_rate",
+        "median_feasibility_rate",
+        "median_near_feasible_rate_10x",
+        "median_min_max_normalized_violation",
     ]
     with path.open("w", encoding="utf-8", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=fieldnames)
@@ -409,6 +474,14 @@ def _summarise_opf_observations(observations: Sequence[Mapping[str, object]]) ->
         value for value in (_finite_float(observation.get("total_violation")) for observation in observations)
         if value is not None
     ]
+    max_violations = [
+        value
+        for value in (
+            _finite_float(observation.get("max_normalized_violation"))
+            for observation in observations
+        )
+        if value is not None
+    ]
     times = [
         value for value in (_finite_float(observation.get("evaluation_time")) for observation in observations)
         if value is not None
@@ -416,6 +489,43 @@ def _summarise_opf_observations(observations: Sequence[Mapping[str, object]]) ->
     first_feasible = next(
         (index for index, observation in enumerate(observations, start=1) if bool(observation.get("feasible", False))),
         None,
+    )
+    initial_feasible_gap = next(
+        (
+            gap
+            for observation in observations
+            if bool(observation.get("feasible", False))
+            for gap in [_finite_float(observation.get("normalised_cost_gap"))]
+            if gap is not None
+        ),
+        None,
+    )
+    improvement_tolerance = 1.0e-9
+    first_feasible_improvement = next(
+        (
+            index
+            for index, observation in enumerate(observations, start=1)
+            if bool(observation.get("feasible", False))
+            and initial_feasible_gap is not None
+            and _finite_float(observation.get("normalised_cost_gap")) is not None
+            and float(observation["normalised_cost_gap"])
+                < initial_feasible_gap - improvement_tolerance
+        ),
+        None,
+    )
+    feasibility_tolerance = next(
+        (
+            value
+            for value in (
+                _finite_float(observation.get("feasibility_tolerance"))
+                for observation in observations
+            )
+            if value is not None and value > 0.0
+        ),
+        1.0e-5,
+    )
+    near_feasible = sum(
+        value <= 10.0 * feasibility_tolerance for value in max_violations
     )
     best_gap = None
     gap_curve: list[float] = []
@@ -426,16 +536,88 @@ def _summarise_opf_observations(observations: Sequence[Mapping[str, object]]) ->
         if best_gap is not None:
             gap_curve.append(max(0.0, best_gap))
     return {
+        "primary_score": min(gaps) if gaps else None,
+        "feasible_improvement_found": first_feasible_improvement is not None,
+        "evals_to_first_feasible_improvement": first_feasible_improvement,
         "best_feasible_cost": min(costs) if costs else None,
         "best_feasible_gap": min(gaps) if gaps else None,
         "feasibility_rate": len(feasible) / len(observations),
         "evals_to_first_feasible": first_feasible,
+        "feasible_evaluations": len(feasible),
         "min_total_violation": min(violations) if violations else None,
+        "min_max_normalized_violation": min(max_violations) if max_violations else None,
+        "near_feasible_rate_10x": near_feasible / len(observations),
         "pf_failure_rate": sum(not bool(item.get("pf_converged", False)) for item in observations) / len(observations),
         "total_evaluation_time": sum(times),
         "anytime_feasible_gap_auc": sum(gap_curve) / len(gap_curve) if gap_curve else None,
-        "regret_label": "penalised_score_regret",
+        "regret_label": "legacy_penalised_score_regret",
     }
+
+
+def _aggregate_summary_rows(rows: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
+    grouped: dict[tuple[str, str], list[Mapping[str, object]]] = {}
+    for row in rows:
+        key = (str(row.get("benchmark_name", "")), str(row.get("method", "")))
+        grouped.setdefault(key, []).append(row)
+
+    result: list[dict[str, object]] = []
+    for (benchmark_name, method), group in sorted(grouped.items()):
+        primary = [
+            value
+            for value in (_finite_float(row.get("primary_score")) for row in group)
+            if value is not None
+        ]
+        feasibility = [
+            value
+            for value in (_finite_float(row.get("feasibility_rate")) for row in group)
+            if value is not None
+        ]
+        near_feasible = [
+            value
+            for value in (_finite_float(row.get("near_feasible_rate_10x")) for row in group)
+            if value is not None
+        ]
+        min_violations = [
+            value
+            for value in (
+                _finite_float(row.get("min_max_normalized_violation"))
+                for row in group
+            )
+            if value is not None
+        ]
+        result.append(
+            {
+                "benchmark_name": benchmark_name,
+                "method": method,
+                "runs": len(group),
+                "primary_score_median": _percentile(primary, 0.50),
+                "primary_score_q1": _percentile(primary, 0.25),
+                "primary_score_q3": _percentile(primary, 0.75),
+                "feasible_improvement_rate": sum(
+                    bool(row.get("feasible_improvement_found", False)) for row in group
+                )
+                / len(group),
+                "median_feasibility_rate": _percentile(feasibility, 0.50),
+                "median_near_feasible_rate_10x": _percentile(near_feasible, 0.50),
+                "median_min_max_normalized_violation": _percentile(min_violations, 0.50),
+            }
+        )
+    return result
+
+
+def _percentile(values: Sequence[float], probability: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(float(value) for value in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = float(probability) * (len(ordered) - 1)
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    if lower == upper:
+        return ordered[lower]
+    fraction = position - lower
+    return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
 
 
 def _finite_float(value: object) -> float | None:
@@ -487,17 +669,22 @@ def _extract_observation_metadata(state_metadata: Mapping[str, object]) -> dict[
         "joint_score": decision.get("joint_score"),
         "expected_improvement": decision.get("expected_improvement"),
         "information_gain": decision.get("information_gain"),
+        "predicted_feasibility_probability": decision.get("predicted_feasibility_probability"),
+        "predicted_constraint_log_ratio": decision.get("predicted_constraint_log_ratio"),
+        "constraint_std": decision.get("constraint_std"),
         "candidate_override": decision.get("candidate_override"),
         "gp_verifier_action": verifier_map.get("action"),
         "gp_verifier_reason": verifier_map.get("reason"),
         "verified_candidate_id": verifier_map.get("verified_candidate_id"),
     }
 
-def _format_vector(value: object) -> str:
+def _format_vector(value: object, *, numeric: bool = True) -> str:
     if value is None:
         return ""
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-        return "[" + ", ".join(f"{float(item):.8g}" for item in value) + "]"
+        if numeric:
+            return "[" + ", ".join(f"{float(item):.8g}" for item in value) + "]"
+        return "[" + ", ".join(str(item) for item in value) + "]"
     return str(value)
 
 
@@ -558,6 +745,8 @@ def _format_step_log(
         f"y={_format_number(observation.get('y'))}",
         f"best={_format_number(observation.get('best_y'))}",
     ]
+    if "primary_best" in observation:
+        parts.append(f"primary={_format_number(observation.get('primary_best'))}")
     agent = observation.get("agent_type")
     strategy = observation.get("executed_strategy") or observation.get("strategy")
     phase = observation.get("budget_phase")

@@ -8,14 +8,14 @@ using PowerModels
 
 const PROJECT_ROOT = normpath(joinpath(@__DIR__, ".."))
 const CASE_PATHS = Dict(
-    "opf_pglib_case14_typ_pg" => joinpath(
+    "opf_pglib_case14_typ_pgvg" => joinpath(
         PROJECT_ROOT,
         "data",
         "pglib-opf",
         "v23.07",
         "pglib_opf_case14_ieee.m",
     ),
-    "opf_pglib_case14_api_pg" => joinpath(
+    "opf_pglib_case14_api_pgvg" => joinpath(
         PROJECT_ROOT,
         "data",
         "pglib-opf",
@@ -53,15 +53,18 @@ end
 function _describe_case(data::Dict{String, Any}, benchmark::String)
     base_mva = Float64(data["baseMVA"])
     reference_buses = _reference_bus_ids(data)
-    controllable_ids = String[]
-    bounds_mw = Vector{Vector{Float64}}()
-    starts_mw = Float64[]
+    controllable_generator_ids = String[]
+    generator_bus_ids = String[]
     slack_generator_ids = String[]
+    variables = Vector{Dict{String, Any}}()
+    bounds = Vector{Vector{Float64}}()
+    original_control_values = Float64[]
 
     for generator_id in _component_keys(data, "gen")
         generator = data["gen"][generator_id]
         Int(generator["gen_status"]) == 0 && continue
         generator_bus = string(Int(generator["gen_bus"]))
+        push!(generator_bus_ids, generator_bus)
         if generator_bus in reference_buses
             push!(slack_generator_ids, generator_id)
             continue
@@ -69,22 +72,55 @@ function _describe_case(data::Dict{String, Any}, benchmark::String)
         pmin = Float64(generator["pmin"])
         pmax = Float64(generator["pmax"])
         if pmax - pmin > 1.0e-10
-            push!(controllable_ids, generator_id)
-            push!(bounds_mw, [pmin * base_mva, pmax * base_mva])
-            push!(starts_mw, Float64(generator["pg"]) * base_mva)
+            lower = pmin * base_mva
+            upper = pmax * base_mva
+            push!(controllable_generator_ids, generator_id)
+            push!(variables, Dict(
+                "name" => "Pg$(generator_id)",
+                "kind" => "pg",
+                "component_id" => generator_id,
+                "bus_id" => generator_bus,
+                "unit" => "MW",
+                "lower" => lower,
+                "upper" => upper,
+            ))
+            push!(bounds, [lower, upper])
+            push!(original_control_values, Float64(generator["pg"]) * base_mva)
         end
     end
 
-    isempty(controllable_ids) && error("case has no non-slack active-power controls")
+    isempty(controllable_generator_ids) && error("case has no non-slack active-power controls")
+    unique_generator_bus_ids = sort(unique(generator_bus_ids); by = key -> parse(Int, key))
+    for bus_id in unique_generator_bus_ids
+        bus = data["bus"][bus_id]
+        lower = Float64(bus["vmin"])
+        upper = Float64(bus["vmax"])
+        push!(variables, Dict(
+            "name" => "Vg$(bus_id)",
+            "kind" => "vg",
+            "component_id" => bus_id,
+            "bus_id" => bus_id,
+            "unit" => "p.u.",
+            "lower" => lower,
+            "upper" => upper,
+        ))
+        push!(bounds, [lower, upper])
+        push!(original_control_values, Float64(bus["vm"]))
+    end
+
     return Dict{String, Any}(
         "benchmark" => benchmark,
         "scenario_id" => splitext(basename(CASE_PATHS[benchmark]))[1],
-        "dim" => length(controllable_ids),
+        "dim" => length(variables),
         "base_mva" => base_mva,
-        "controllable_generator_ids" => controllable_ids,
+        "control_mode" => "non_slack_active_pg_and_generator_bus_vg",
+        "variables" => variables,
+        "bounds" => bounds,
+        "control_names" => [variable["name"] for variable in variables],
+        "original_control_values" => original_control_values,
+        "controllable_generator_ids" => controllable_generator_ids,
+        "generator_bus_ids" => unique_generator_bus_ids,
         "slack_generator_ids" => slack_generator_ids,
-        "bounds_mw" => bounds_mw,
-        "recommended_start_mw" => starts_mw,
     )
 end
 
@@ -104,53 +140,49 @@ function _is_solved(result::Dict{String, Any})
     return status in ("LOCALLY_SOLVED", "ALMOST_LOCALLY_SOLVED", "OPTIMAL", "ALMOST_OPTIMAL")
 end
 
-function _restricted_reference(benchmark::String)
+function _extract_control_values(description::Dict{String, Any}, solution::Dict{String, Any})
+    base_mva = Float64(description["base_mva"])
+    values = Float64[]
+    for variable in description["variables"]
+        if variable["kind"] == "pg"
+            generator_id = string(variable["component_id"])
+            value = Float64(solution["gen"][generator_id]["pg"]) * base_mva
+            push!(values, clamp(
+                value, Float64(variable["lower"]), Float64(variable["upper"]),
+            ))
+        elseif variable["kind"] == "vg"
+            bus_id = string(variable["bus_id"])
+            value = Float64(solution["bus"][bus_id]["vm"])
+            push!(values, clamp(
+                value, Float64(variable["lower"]), Float64(variable["upper"]),
+            ))
+        else
+            error("unknown OPF control kind: $(variable["kind"])")
+        end
+    end
+    return values
+end
+
+function _full_reference(benchmark::String)
     if haskey(REFERENCE_RESULTS, benchmark)
         return REFERENCE_RESULTS[benchmark]
     end
 
-    initial_data = deepcopy(CASE_DATA[benchmark])
-    initial_result = PowerModels.solve_ac_opf(initial_data, SOLVER)
-    _is_solved(initial_result) || error(
-        "initial AC-OPF failed for $(benchmark): $(get(initial_result, "termination_status", "unknown"))",
-    )
-    voltage_setpoints = Dict{String, Float64}()
-    for generator in values(initial_data["gen"])
-        Int(generator["gen_status"]) == 0 && continue
-        bus_id = string(Int(generator["gen_bus"]))
-        voltage_setpoints[bus_id] = Float64(initial_result["solution"]["bus"][bus_id]["vm"])
-    end
-
     data = deepcopy(CASE_DATA[benchmark])
-    for (bus_id, setpoint) in voltage_setpoints
-        bus = data["bus"][bus_id]
-        bus["vm"] = setpoint
-        bus["vmin"] = setpoint
-        bus["vmax"] = setpoint
-    end
-
     started = time()
     result = PowerModels.solve_ac_opf(data, SOLVER)
     _is_solved(result) || error(
-        "restricted AC-OPF failed for $(benchmark): $(get(result, "termination_status", "unknown"))",
+        "AC-OPF failed for $(benchmark): $(get(result, "termination_status", "unknown"))",
     )
-    base_mva = Float64(data["baseMVA"])
     description = CASE_DESCRIPTIONS[benchmark]
-    bounds_mw = description["bounds_mw"]
-    pg_mw = [
-        clamp(
-            Float64(result["solution"]["gen"][generator_id]["pg"]) * base_mva,
-            Float64(bounds_mw[index][1]),
-            Float64(bounds_mw[index][2]),
-        ) for (index, generator_id) in enumerate(description["controllable_generator_ids"])
-    ]
+    control_values = _extract_control_values(description, result["solution"])
     reference = Dict{String, Any}(
         "benchmark" => benchmark,
         "scenario_id" => description["scenario_id"],
         "reference_cost" => Float64(result["objective"]),
-        "reference_pg_mw" => pg_mw,
-        "voltage_setpoints" => voltage_setpoints,
-        "reference_kind" => "restricted_pg_with_frozen_ac_opf_voltage_setpoints",
+        "reference_control_values" => control_values,
+        "control_names" => description["control_names"],
+        "reference_kind" => "full_ac_opf_pg_vg",
         "termination_status" => string(result["termination_status"]),
         "solve_time" => Float64(get(result, "solve_time", time() - started)),
     )
@@ -334,10 +366,21 @@ function _failed_evaluation(
     elapsed::Float64,
     status::String,
     message::String,
+    control_values,
 )
     return Dict{String, Any}(
         "benchmark" => benchmark,
         "scenario_id" => CASE_DESCRIPTIONS[benchmark]["scenario_id"],
+        "control_names" => CASE_DESCRIPTIONS[benchmark]["control_names"],
+        "control_values" => Float64.(control_values),
+        "pg_mw" => [
+            Float64(value) for (variable, value) in zip(CASE_DESCRIPTIONS[benchmark]["variables"], control_values)
+            if variable["kind"] == "pg"
+        ],
+        "vg_pu" => [
+            Float64(value) for (variable, value) in zip(CASE_DESCRIPTIONS[benchmark]["variables"], control_values)
+            if variable["kind"] == "vg"
+        ],
         "pf_converged" => false,
         "feasible" => false,
         "generation_cost" => nothing,
@@ -355,23 +398,31 @@ function _failed_evaluation(
     )
 end
 
-function _evaluate_case(benchmark::String, pg_mw, feasibility_tolerance::Float64)
+function _apply_controls!(data::Dict{String, Any}, description::Dict{String, Any}, control_values)
+    variables = description["variables"]
+    length(control_values) == length(variables) || error(
+        "expected $(length(variables)) Pg+Vg controls, got $(length(control_values))",
+    )
+    base_mva = Float64(data["baseMVA"])
+    for (variable, raw_value) in zip(variables, control_values)
+        value = Float64(raw_value)
+        if variable["kind"] == "pg"
+            data["gen"][string(variable["component_id"])]["pg"] = value / base_mva
+        elseif variable["kind"] == "vg"
+            data["bus"][string(variable["bus_id"])]["vm"] = value
+        else
+            error("unknown OPF control kind: $(variable["kind"])")
+        end
+    end
+end
+
+function _evaluate_case(benchmark::String, control_values, feasibility_tolerance::Float64)
     haskey(CASE_DATA, benchmark) || error("unknown OPF benchmark: $(benchmark)")
     description = CASE_DESCRIPTIONS[benchmark]
-    controls = description["controllable_generator_ids"]
-    length(pg_mw) == length(controls) || error(
-        "expected $(length(controls)) Pg controls, got $(length(pg_mw))",
-    )
-    reference = _restricted_reference(benchmark)
+    reference = _full_reference(benchmark)
     started = time()
     data = deepcopy(CASE_DATA[benchmark])
-    base_mva = Float64(data["baseMVA"])
-    for (bus_id, setpoint) in reference["voltage_setpoints"]
-        data["bus"][bus_id]["vm"] = Float64(setpoint)
-    end
-    for (generator_id, value) in zip(controls, pg_mw)
-        data["gen"][generator_id]["pg"] = Float64(value) / base_mva
-    end
+    _apply_controls!(data, description, control_values)
 
     result = try
         PowerModels.solve_ac_pf(data, SOLVER)
@@ -382,6 +433,7 @@ function _evaluate_case(benchmark::String, pg_mw, feasibility_tolerance::Float64
             time() - started,
             "EXCEPTION",
             sprint(showerror, error),
+            control_values,
         )
     end
     status = string(get(result, "termination_status", "unknown"))
@@ -392,6 +444,7 @@ function _evaluate_case(benchmark::String, pg_mw, feasibility_tolerance::Float64
             time() - started,
             status,
             "AC power flow did not converge",
+            control_values,
         )
     end
 
@@ -400,6 +453,16 @@ function _evaluate_case(benchmark::String, pg_mw, feasibility_tolerance::Float64
     diagnostics = _constraint_diagnostics(data)
     generation_cost = _generation_cost(data)
     max_violation = Float64(diagnostics["max_normalized_violation"])
+    pg_mw = [
+        Float64(value)
+        for (variable, value) in zip(description["variables"], control_values)
+        if variable["kind"] == "pg"
+    ]
+    vg_pu = [
+        Float64(value)
+        for (variable, value) in zip(description["variables"], control_values)
+        if variable["kind"] == "vg"
+    ]
     return merge(
         diagnostics,
         Dict{String, Any}(
@@ -409,6 +472,10 @@ function _evaluate_case(benchmark::String, pg_mw, feasibility_tolerance::Float64
             "feasible" => max_violation <= feasibility_tolerance,
             "generation_cost" => generation_cost,
             "reference_cost" => Float64(reference["reference_cost"]),
+            "control_names" => description["control_names"],
+            "control_values" => Float64.(control_values),
+            "pg_mw" => pg_mw,
+            "vg_pu" => vg_pu,
             "evaluation_time" => time() - started,
             "reference_kind" => reference["reference_kind"],
             "solver_time" => Float64(get(result, "solve_time", 0.0)),
@@ -428,17 +495,17 @@ function _handle_request(request::Dict{String, Any})
         haskey(CASE_DESCRIPTIONS, benchmark) || error("unknown OPF benchmark: $(benchmark)")
         return CASE_DESCRIPTIONS[benchmark]
     elseif action == "reference"
-        return _restricted_reference(string(request["benchmark"]))
+        return _full_reference(string(request["benchmark"]))
     elseif action == "evaluate"
         benchmark = string(request["benchmark"])
-        pg_mw = Float64.(request["pg_mw"])
+        control_values = Float64.(request["control_values"])
         tolerance = Float64(_request_value(request, "feasibility_tolerance", 1.0e-5))
-        return _evaluate_case(benchmark, pg_mw, tolerance)
+        return _evaluate_case(benchmark, control_values, tolerance)
     elseif action == "warmup"
         warmed = Dict{String, Any}()
         for benchmark in sort(collect(keys(CASE_DATA)))
-            reference = _restricted_reference(benchmark)
-            start = reference["reference_pg_mw"]
+            reference = _full_reference(benchmark)
+            start = reference["reference_control_values"]
             evaluation = _evaluate_case(benchmark, start, 1.0e-5)
             warmed[benchmark] = Dict(
                 "reference_cost" => reference["reference_cost"],
@@ -483,4 +550,6 @@ function _serve()
     end
 end
 
-_serve()
+if abspath(PROGRAM_FILE) == @__FILE__
+    _serve()
+end
