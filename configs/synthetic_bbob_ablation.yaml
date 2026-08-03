@@ -1,0 +1,77 @@
+experiment:
+  methods:
+    - wmbo_llm
+    - wmbo_no_descriptor
+    - wmbo_no_information_gain
+    - wmbo_no_hypothesis_tracking
+    - wmbo_no_gp_verifier
+    - wmbo_rule
+  seeds: [0]
+  budget: 100
+  budget_per_dimension: 20
+  initial_samples: 10
+  initial_samples_per_dimension: 2
+  shared_initial_design: sobol
+  candidate_pool_size: 2048
+  output_dir: results/synthetic_bbob_ablation
+
+benchmark_suite:
+  bbob:
+    functions: [1, 3, 6, 8, 10, 15, 20, 24]
+    dimensions: [5]
+    instances: [1, 2, 3, 4, 5]
+
+optimizer:
+  method_options:
+    wmbo_no_descriptor:
+      base_method: wmbo_llm
+      disable_world_model_descriptor: true
+    wmbo_no_information_gain:
+      base_method: wmbo_llm
+      wmbo_control:
+        information_gain_weight: 0.0
+        hypothesis_alignment_weight: 0.15
+        gp_verifier_enabled: true
+    wmbo_no_hypothesis_tracking:
+      base_method: wmbo_llm
+      disable_hypothesis_tracking: true
+    wmbo_no_gp_verifier:
+      base_method: wmbo_llm
+      wmbo_control:
+        information_gain_weight: 0.35
+        hypothesis_alignment_weight: 0.15
+        gp_verifier_enabled: false
+  wmbo_control:
+    candidate_options_per_strategy: 5
+    hypothesis_alignment_weight: 0.15
+    information_gain_weight: 0.35
+    hypothesis_support_probability: 0.80
+    hypothesis_rejection_probability: 0.20
+    hypothesis_support_likelihood_ratio: 3.0
+    hypothesis_failure_likelihood_ratio: 0.50
+    hypothesis_min_relevant_evidence: 1
+    gp_verifier_enabled: true
+    gp_verifier_min_score_ratio: 0.75
+    gp_verifier_duplicate_distance: 0.0001
+
+llm:
+  enabled: true
+  provider: SiliconFlow
+  model: deepseek-ai/DeepSeek-V4-Flash
+  base_url: https://api.siliconflow.cn/v1
+  temperature: 0.0
+  fallback_to_rule: false
+  timeout: 120
+  max_retries: 3
+  retry_delay_seconds: 2
+
+execution:
+  continue_on_error: true
+  resume: true
+
+reporting:
+  bootstrap_samples: 10000
+  confidence_level: 0.95
+
+logging:
+  verbose: true

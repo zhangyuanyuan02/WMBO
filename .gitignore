@@ -2,6 +2,8 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.pytest-tmp*/
+.mplconfig*/
 *.egg-info/
 
 # Virtual environments
@@ -16,7 +18,15 @@ models/
 outputs/
 output/
 tmp/
-87RP Readme Projectdescription.docx
+
+# Root-level research and submission materials (not project code)
+/paper/
+/paper-template/
+/*.docx
+/*.pdf
+/*.pptx
+/*.xlsx
+/*.zip
 
 # OS/editor files
 .DS_Store

@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 import csv
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import hashlib
+import importlib.metadata
+import json
 import math
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
+import time
 from typing import Any, Mapping, Sequence
+
+from scipy.stats import qmc
 
 from .benchmarks import EvaluationRequest, evaluate, get_benchmark
 from .control import OptimizerConfig, RunConfig, build_default_optimizer_config
@@ -87,14 +94,27 @@ def run_single_benchmark(request: BenchmarkRunRequest) -> BenchmarkRunResult:
 
     observations: list[dict[str, object]] = []
     objective_values: list[float] = []
+    shared_initial = _shared_initial_points(
+        benchmark_name=benchmark.name,
+        dim=benchmark.dim,
+        count=optimizer_config.initial_samples,
+        seed=request.seed,
+        mode=str(optimizer_config.options.get("shared_initial_design", "none")),
+    )
+    run_started = time.perf_counter()
 
     for step in range(request.budget):
         if log_enabled:
             _log(f"{run_label} step {step + 1}/{request.budget} ask")
-        if step == 0 and benchmark.recommended_start_unit is not None:
+        ask_started = time.perf_counter()
+        if step < len(shared_initial):
+            x_unit = list(shared_initial[step])
+        elif step == 0 and benchmark.recommended_start_unit is not None:
             x_unit = [float(value) for value in benchmark.recommended_start_unit]
         else:
             x_unit = optimizer.ask(state)
+        optimizer_ask_time = time.perf_counter() - ask_started
+        evaluation_started = time.perf_counter()
         result = evaluate(
             EvaluationRequest(
                 benchmark_name=benchmark.name,
@@ -103,7 +123,10 @@ def run_single_benchmark(request: BenchmarkRunRequest) -> BenchmarkRunResult:
                 options=_evaluation_options(request.metadata),
             )
         )
+        objective_evaluation_time = time.perf_counter() - evaluation_started
+        tell_started = time.perf_counter()
         state = optimizer.tell(state, result)
+        optimizer_tell_time = time.perf_counter() - tell_started
         objective_values.append(float(result.y))
         best_curve = cumulative_best(objective_values, minimise=True)
         regret_curve = simple_regret(best_curve, benchmark.optimum_value)
@@ -139,6 +162,10 @@ def run_single_benchmark(request: BenchmarkRunRequest) -> BenchmarkRunResult:
             "best_y": best_curve[-1],
             "primary_best": primary_best,
             "simple_regret": regret_curve[-1],
+            "optimizer_ask_time": optimizer_ask_time,
+            "optimizer_tell_time": optimizer_tell_time,
+            "objective_evaluation_time": objective_evaluation_time,
+            "is_shared_initial": step < len(shared_initial),
             **evaluation_metadata,
             **optimiser_metadata,
         }
@@ -154,7 +181,19 @@ def run_single_benchmark(request: BenchmarkRunRequest) -> BenchmarkRunResult:
         seed=request.seed,
         values=objective_values,
         optimum_value=benchmark.optimum_value,
-        metadata=_summarise_opf_observations(observations) if benchmark.family == "opf" else {},
+        initial_samples=optimizer_config.initial_samples,
+        metadata={
+            **(_summarise_opf_observations(observations) if benchmark.family == "opf" else {}),
+            **_summarise_llm_observations(observations),
+            "total_run_time": time.perf_counter() - run_started,
+            "total_optimizer_time": sum(
+                float(item["optimizer_ask_time"]) + float(item["optimizer_tell_time"])
+                for item in observations
+            ),
+            "total_objective_evaluation_time": sum(
+                float(item["objective_evaluation_time"]) for item in observations
+            ),
+        },
     )
     result = BenchmarkRunResult(
         request=request,
@@ -183,7 +222,13 @@ def run_single_benchmark(request: BenchmarkRunRequest) -> BenchmarkRunResult:
     return result
 
 
-def run_benchmark_suite(config: RunConfig) -> list[BenchmarkRunResult]:
+def run_benchmark_suite(
+    config: RunConfig,
+    *,
+    resume: bool = False,
+    continue_on_error: bool = False,
+    workers: int | None = None,
+) -> list[BenchmarkRunResult]:
     """Run a collection of benchmarks, methods, and seeds.
 
     Input:
@@ -197,16 +242,29 @@ def run_benchmark_suite(config: RunConfig) -> list[BenchmarkRunResult]:
     methods = list(config.methods) or ["random"]
     seeds = list(config.seeds) or [0]
 
-    results: list[BenchmarkRunResult] = []
+    results_by_index: dict[int, BenchmarkRunResult] = {}
+    failures: list[dict[str, object]] = []
+    fingerprint = _config_fingerprint(config)
+    if config.output_dir:
+        _prepare_manifest(config, fingerprint=fingerprint, resume=resume)
     total_runs = len(benchmarks) * len(methods) * len(seeds)
+    worker_count = _resolve_worker_count(config, workers)
+    if worker_count > 1 and any(
+        str(method).lower().replace("-", "_") == "wmbo_llm" for method in methods
+    ):
+        raise ValueError(
+            "Parallel execution is disabled for wmbo_llm to avoid uncontrolled concurrent API calls. "
+            "Run the LLM suite with workers=1."
+        )
     run_index = 0
     suite_logging = _logging_enabled(config.optimizer.options)
     if suite_logging:
         _log(
             f"[suite] start benchmarks={len(benchmarks)} methods={len(methods)} "
             f"seeds={len(seeds)} total_runs={total_runs} budget={config.optimizer.budget} "
-            f"output={config.output_dir}"
+            f"workers={worker_count} output={config.output_dir}"
         )
+    pending: list[tuple[int, BenchmarkRunRequest]] = []
     for benchmark_name in benchmarks:
         for method in methods:
             for seed in seeds:
@@ -215,7 +273,7 @@ def run_benchmark_suite(config: RunConfig) -> list[BenchmarkRunResult]:
                     benchmark_name=benchmark_name,
                     method=method,
                     seed=int(seed),
-                    budget=int(config.optimizer.budget),
+                    budget=_budget_for_benchmark(config, benchmark_name),
                     output_dir=config.output_dir,
                     metadata={
                         "initial_samples": config.optimizer.initial_samples,
@@ -227,20 +285,161 @@ def run_benchmark_suite(config: RunConfig) -> list[BenchmarkRunResult]:
                     },
                 )
                 try:
-                    results.append(run_single_benchmark(request))
+                    if resume:
+                        saved = _load_completed_run(request, fingerprint=fingerprint)
+                        if saved is not None:
+                            results_by_index[run_index] = saved
+                            continue
                 except Exception as exc:
+                    _record_failure(
+                        failures=failures,
+                        request=request,
+                        error=exc,
+                        suite_logging=suite_logging,
+                    )
+                    if not continue_on_error:
+                        raise
+                else:
+                    pending.append((run_index, request))
+
+    if worker_count == 1:
+        for run_index, request in pending:
+            try:
+                result = _execute_run_request(request, fingerprint)
+                results_by_index[run_index] = result
+            except Exception as exc:
+                _record_failure(
+                    failures=failures,
+                    request=request,
+                    error=exc,
+                    suite_logging=suite_logging,
+                )
+                if not continue_on_error:
+                    raise
+    elif pending:
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            future_to_request = {
+                executor.submit(_execute_run_request, _quiet_parallel_request(request), fingerprint): (run_index, request)
+                for run_index, request in pending
+            }
+            for future in as_completed(future_to_request):
+                run_index, request = future_to_request[future]
+                try:
+                    results_by_index[run_index] = future.result()
                     if suite_logging:
                         _log(
-                            f"[run {run_index}/{total_runs}] failed "
-                            f"benchmark={benchmark_name} method={method} seed={seed}: {exc}"
+                            f"[run {run_index}/{total_runs}] done "
+                            f"benchmark={request.benchmark_name} method={request.method} seed={request.seed}"
                         )
-                    raise
+                except Exception as exc:
+                    _record_failure(
+                        failures=failures,
+                        request=request,
+                        error=exc,
+                        suite_logging=suite_logging,
+                    )
+                    if not continue_on_error:
+                        for pending_future in future_to_request:
+                            pending_future.cancel()
+                        raise
+
+    results = [results_by_index[index] for index in sorted(results_by_index)]
 
     if config.output_dir:
         save_suite_summary(results, config.output_dir)
+        write_json(Path(config.output_dir) / "failed_runs.json", failures)
+        _finish_manifest(config.output_dir, completed=len(results), failed=len(failures))
     if suite_logging:
         _log(f"[suite] done completed_runs={len(results)} output={config.output_dir}")
     return results
+
+
+def _execute_run_request(request: BenchmarkRunRequest, fingerprint: str) -> BenchmarkRunResult:
+    """Run and atomically mark one request; suitable for a worker process."""
+
+    result = run_single_benchmark(request)
+    _write_run_fingerprint(request, fingerprint)
+    return result
+
+
+def _quiet_parallel_request(request: BenchmarkRunRequest) -> BenchmarkRunRequest:
+    """Suppress per-step worker output while retaining parent progress messages."""
+
+    metadata = dict(request.metadata)
+    options = metadata.get("options", {})
+    copied_options = dict(options) if isinstance(options, Mapping) else {}
+    logging_options = copied_options.get("logging", {})
+    copied_logging = dict(logging_options) if isinstance(logging_options, Mapping) else {}
+    copied_logging["verbose"] = False
+    copied_options["logging"] = copied_logging
+    metadata["options"] = copied_options
+    return BenchmarkRunRequest(
+        benchmark_name=request.benchmark_name,
+        method=request.method,
+        seed=request.seed,
+        budget=request.budget,
+        output_dir=request.output_dir,
+        metadata=metadata,
+    )
+
+
+def _resolve_worker_count(config: RunConfig, workers: int | None) -> int:
+    if workers is not None:
+        if int(workers) < 1:
+            raise ValueError("workers must be at least 1.")
+        return int(workers)
+    execution = config.optimizer.options.get("execution", {})
+    configured = execution.get("workers", 1) if isinstance(execution, Mapping) else 1
+    if int(configured) < 1:
+        raise ValueError("execution.workers must be at least 1.")
+    return int(configured)
+
+
+def _record_failure(
+    *,
+    failures: list[dict[str, object]],
+    request: BenchmarkRunRequest,
+    error: Exception,
+    suite_logging: bool,
+) -> None:
+    if suite_logging:
+        _log(
+            f"{_run_label(request)} failed benchmark={request.benchmark_name} "
+            f"method={request.method} seed={request.seed}: {error}"
+        )
+    failure: dict[str, object] = {
+        "benchmark_name": request.benchmark_name,
+        "method": request.method,
+        "seed": request.seed,
+        "error_type": type(error).__name__,
+        "error": str(error),
+    }
+    telemetry = getattr(error, "telemetry", None)
+    if isinstance(telemetry, Mapping):
+        failure["llm_telemetry"] = _to_jsonable(telemetry)
+    failures.append(failure)
+
+
+def describe_benchmark_suite(config: RunConfig) -> dict[str, object]:
+    """Return an execution estimate without evaluating any objective."""
+
+    run_count = len(config.benchmarks) * len(config.methods) * len(config.seeds)
+    evaluations = 0
+    llm_calls = 0
+    for benchmark_name in config.benchmarks:
+        budget = _budget_for_benchmark(config, benchmark_name)
+        initial = _initial_samples_for_benchmark(config, benchmark_name, budget)
+        evaluations += budget * len(config.methods) * len(config.seeds)
+        if "wmbo_llm" in {str(method).lower().replace("-", "_") for method in config.methods}:
+            llm_calls += max(0, budget - initial) * len(config.seeds)
+    return {
+        "benchmarks": len(config.benchmarks),
+        "methods": len(config.methods),
+        "seeds": len(config.seeds),
+        "runs": run_count,
+        "evaluations": evaluations,
+        "estimated_llm_calls": llm_calls,
+    }
 
 
 def save_run_result(result: BenchmarkRunResult, output_dir: str) -> None:
@@ -292,6 +491,15 @@ def _make_optimizer_config(request: BenchmarkRunRequest) -> OptimizerConfig:
     candidate_pool_size = int(metadata.get("candidate_pool_size", config.candidate_pool_size) or config.candidate_pool_size)
     raw_options = metadata.get("options", {})
     options = dict(raw_options) if isinstance(raw_options, Mapping) else {}
+    per_dim = options.get("initial_samples_per_dimension")
+    if per_dim is not None:
+        benchmark = get_benchmark(request.benchmark_name)
+        initial_samples = max(1, int(per_dim) * benchmark.dim)
+    method_options = options.get("method_options", {})
+    if isinstance(method_options, Mapping):
+        override = method_options.get(request.method, {})
+        if isinstance(override, Mapping):
+            options.update(dict(override))
     return OptimizerConfig(
         method=request.method,
         budget=config.budget,
@@ -302,8 +510,156 @@ def _make_optimizer_config(request: BenchmarkRunRequest) -> OptimizerConfig:
     )
 
 
+def _initial_samples_for_benchmark(config: RunConfig, benchmark_name: str, budget: int) -> int:
+    per_dim = config.optimizer.options.get("initial_samples_per_dimension")
+    if per_dim is None:
+        return max(1, min(config.optimizer.initial_samples, budget))
+    return max(1, min(int(per_dim) * get_benchmark(benchmark_name).dim, budget))
+
+
+def _budget_for_benchmark(config: RunConfig, benchmark_name: str) -> int:
+    per_dim = config.optimizer.options.get("budget_per_dimension")
+    if per_dim is None:
+        return int(config.optimizer.budget)
+    return max(1, int(per_dim) * get_benchmark(benchmark_name).dim)
+
+
+def _shared_initial_points(
+    *,
+    benchmark_name: str,
+    dim: int,
+    count: int,
+    seed: int,
+    mode: str,
+) -> list[list[float]]:
+    if mode.strip().lower() not in {"sobol", "shared_sobol"}:
+        return []
+    digest = hashlib.sha256(f"{benchmark_name}|{int(seed)}".encode("utf-8")).digest()
+    sobol_seed = int.from_bytes(digest[:4], "big", signed=False)
+    power = int(math.ceil(math.log2(max(1, int(count)))))
+    points = qmc.Sobol(d=int(dim), scramble=True, seed=sobol_seed).random_base2(power)
+    return points[: int(count)].astype(float).tolist()
+
+
 def _run_directory(output_dir: str, benchmark_name: str, method: str, seed: int) -> Path:
     return Path(output_dir) / benchmark_name / method / f"seed_{seed}"
+
+
+def _config_fingerprint(config: RunConfig) -> str:
+    sanitized = _sanitize_config_value(asdict(config))
+    payload = json.dumps(sanitized, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _sanitize_config_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {
+            str(key): ("<redacted>" if "key" in str(key).lower() else _sanitize_config_value(item))
+            for key, item in value.items()
+        }
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_sanitize_config_value(item) for item in value]
+    return value
+
+
+def _prepare_manifest(config: RunConfig, *, fingerprint: str, resume: bool) -> None:
+    output = ensure_dir(config.output_dir)
+    path = output / "manifest.json"
+    if path.exists():
+        with path.open("r", encoding="utf-8") as file:
+            existing = json.load(file)
+        existing_fingerprint = existing.get("config_fingerprint") if isinstance(existing, Mapping) else None
+        if existing_fingerprint != fingerprint:
+            raise ValueError(
+                "Output directory contains results from a different configuration; "
+                "choose a new output directory or restore the matching config."
+            )
+        if not resume:
+            raise ValueError("Output directory already has a manifest; use --resume to continue.")
+        return
+    write_json(
+        path,
+        {
+            "config_fingerprint": fingerprint,
+            "status": "running",
+            "created_unix": time.time(),
+            "config": _sanitize_config_value(asdict(config)),
+            "dependencies": _dependency_versions(),
+        },
+    )
+
+
+def _dependency_versions() -> dict[str, str]:
+    versions: dict[str, str] = {}
+    for package in ("numpy", "scipy", "scikit-learn", "ioh", "optuna", "cma", "HEBO"):
+        try:
+            versions[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            versions[package] = "not-installed"
+    return versions
+
+
+def _write_run_fingerprint(request: BenchmarkRunRequest, fingerprint: str) -> None:
+    if request.output_dir is None:
+        return
+    write_json(
+        _run_directory(request.output_dir, request.benchmark_name, request.method, request.seed)
+        / "complete.json",
+        {"config_fingerprint": fingerprint, "status": "complete"},
+    )
+
+
+def _load_completed_run(
+    request: BenchmarkRunRequest,
+    *,
+    fingerprint: str,
+) -> BenchmarkRunResult | None:
+    if request.output_dir is None:
+        return None
+    directory = _run_directory(request.output_dir, request.benchmark_name, request.method, request.seed)
+    marker = directory / "complete.json"
+    run_path = directory / "run.json"
+    if not marker.exists() or not run_path.exists():
+        return None
+    with marker.open("r", encoding="utf-8") as file:
+        marker_data = json.load(file)
+    if marker_data.get("config_fingerprint") != fingerprint:
+        raise ValueError(f"Run fingerprint mismatch: {directory}")
+    with run_path.open("r", encoding="utf-8") as file:
+        data = json.load(file)
+    summary_data = dict(data["summary"])
+    summary = RunSummary(
+        benchmark_name=str(summary_data["benchmark_name"]),
+        method=str(summary_data["method"]),
+        seed=int(summary_data["seed"]),
+        final_best=_finite_float(summary_data.get("final_best")),
+        final_regret=_finite_float(summary_data.get("final_regret")),
+        num_evaluations=int(summary_data["num_evaluations"]),
+        metadata=dict(summary_data.get("metadata", {})),
+    )
+    return BenchmarkRunResult(
+        request=request,
+        summary=summary,
+        observations=list(data.get("observations", [])),
+        metadata=dict(data.get("metadata", {})),
+    )
+
+
+def _finish_manifest(output_dir: str, *, completed: int, failed: int) -> None:
+    path = Path(output_dir) / "manifest.json"
+    if not path.exists():
+        return
+    with path.open("r", encoding="utf-8") as file:
+        data = json.load(file)
+    data.update(
+        {
+            "status": "complete" if failed == 0 else "complete_with_failures",
+            "completed_runs": completed,
+            "failed_runs": failed,
+            "finished_unix": time.time(),
+        }
+    )
+    write_json(path, data)
 
 
 def _summary_to_dict(summary: RunSummary) -> dict[str, object]:
@@ -327,6 +683,10 @@ def _write_observations_csv(path: Path, observations: Sequence[Mapping[str, obje
         "best_y",
         "primary_best",
         "simple_regret",
+        "is_shared_initial",
+        "optimizer_ask_time",
+        "optimizer_tell_time",
+        "objective_evaluation_time",
         "family",
         "constrained",
         "generation_cost",
@@ -381,6 +741,14 @@ def _write_observations_csv(path: Path, observations: Sequence[Mapping[str, obje
         "strategy_success_rates",
         "agent_type",
         "llm_error",
+        "llm_model",
+        "llm_calls",
+        "llm_prompt_tokens",
+        "llm_completion_tokens",
+        "llm_reasoning_tokens",
+        "llm_total_tokens",
+        "llm_latency_seconds",
+        "llm_attempts",
         "requested_candidate_id",
         "selected_candidate_id",
         "evidence_role",
@@ -418,6 +786,11 @@ def _write_summary_csv(path: Path, rows: Sequence[Mapping[str, object]]) -> None
     ensure_dir(path.parent)
     fieldnames = [
         "benchmark_name", "method", "seed", "final_best", "final_regret", "num_evaluations",
+        "log10_final_regret", "relative_regret_auc", "initial_design_regret",
+        "target_success_rate", "target_auc", "total_run_time", "total_optimizer_time",
+        "total_objective_evaluation_time", "llm_calls", "llm_prompt_tokens",
+        "llm_completion_tokens", "llm_reasoning_tokens", "llm_total_tokens",
+        "llm_latency_seconds",
         "primary_score", "feasible_improvement_found", "evals_to_first_feasible_improvement",
         "best_feasible_cost", "best_feasible_gap", "feasibility_rate", "evals_to_first_feasible",
         "feasible_evaluations", "min_total_violation", "min_max_normalized_violation",
@@ -444,6 +817,12 @@ def _write_aggregate_summary_csv(path: Path, rows: Sequence[Mapping[str, object]
         "median_feasibility_rate",
         "median_near_feasible_rate_10x",
         "median_min_max_normalized_violation",
+        "final_regret_median",
+        "final_regret_q1",
+        "final_regret_q3",
+        "log10_final_regret_median",
+        "relative_regret_auc_median",
+        "target_auc_median",
     ]
     with path.open("w", encoding="utf-8", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=fieldnames)
@@ -554,6 +933,30 @@ def _summarise_opf_observations(observations: Sequence[Mapping[str, object]]) ->
     }
 
 
+def _summarise_llm_observations(observations: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    llm_rows = [row for row in observations if _finite_float(row.get("llm_calls")) is not None]
+    if not llm_rows:
+        return {
+            "llm_calls": 0,
+            "llm_prompt_tokens": 0,
+            "llm_completion_tokens": 0,
+            "llm_reasoning_tokens": 0,
+            "llm_total_tokens": 0,
+            "llm_latency_seconds": 0.0,
+        }
+    return {
+        key: sum(_finite_float(row.get(key)) or 0.0 for row in llm_rows)
+        for key in (
+            "llm_calls",
+            "llm_prompt_tokens",
+            "llm_completion_tokens",
+            "llm_reasoning_tokens",
+            "llm_total_tokens",
+            "llm_latency_seconds",
+        )
+    }
+
+
 def _aggregate_summary_rows(rows: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
     grouped: dict[tuple[str, str], list[Mapping[str, object]]] = {}
     for row in rows:
@@ -585,6 +988,22 @@ def _aggregate_summary_rows(rows: Sequence[Mapping[str, object]]) -> list[dict[s
             )
             if value is not None
         ]
+        final_regrets = [
+            value for value in (_finite_float(row.get("final_regret")) for row in group)
+            if value is not None
+        ]
+        log_regrets = [
+            value for value in (_finite_float(row.get("log10_final_regret")) for row in group)
+            if value is not None
+        ]
+        relative_aucs = [
+            value for value in (_finite_float(row.get("relative_regret_auc")) for row in group)
+            if value is not None
+        ]
+        target_aucs = [
+            value for value in (_finite_float(row.get("target_auc")) for row in group)
+            if value is not None
+        ]
         result.append(
             {
                 "benchmark_name": benchmark_name,
@@ -600,6 +1019,12 @@ def _aggregate_summary_rows(rows: Sequence[Mapping[str, object]]) -> list[dict[s
                 "median_feasibility_rate": _percentile(feasibility, 0.50),
                 "median_near_feasible_rate_10x": _percentile(near_feasible, 0.50),
                 "median_min_max_normalized_violation": _percentile(min_violations, 0.50),
+                "final_regret_median": _percentile(final_regrets, 0.50),
+                "final_regret_q1": _percentile(final_regrets, 0.25),
+                "final_regret_q3": _percentile(final_regrets, 0.75),
+                "log10_final_regret_median": _percentile(log_regrets, 0.50),
+                "relative_regret_auc_median": _percentile(relative_aucs, 0.50),
+                "target_auc_median": _percentile(target_aucs, 0.50),
             }
         )
     return result
@@ -662,6 +1087,14 @@ def _extract_observation_metadata(state_metadata: Mapping[str, object]) -> dict[
         "strategy_success_rates": decision.get("strategy_success_rates"),
         "agent_type": decision.get("agent_type"),
         "llm_error": decision.get("llm_error"),
+        "llm_model": decision.get("llm_model"),
+        "llm_calls": decision.get("llm_calls"),
+        "llm_prompt_tokens": decision.get("llm_prompt_tokens"),
+        "llm_completion_tokens": decision.get("llm_completion_tokens"),
+        "llm_reasoning_tokens": decision.get("llm_reasoning_tokens"),
+        "llm_total_tokens": decision.get("llm_total_tokens"),
+        "llm_latency_seconds": decision.get("llm_latency_seconds"),
+        "llm_attempts": decision.get("llm_attempts"),
         "requested_candidate_id": decision.get("requested_candidate_id"),
         "selected_candidate_id": decision.get("selected_candidate_id"),
         "evidence_role": decision.get("evidence_role"),
@@ -784,6 +1217,7 @@ __all__ = [
     "BenchmarkRunResult",
     "run_single_benchmark",
     "run_benchmark_suite",
+    "describe_benchmark_suite",
     "save_run_result",
     "save_suite_summary",
 ]

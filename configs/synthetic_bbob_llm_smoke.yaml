@@ -1,0 +1,41 @@
+experiment:
+  methods: [wmbo_rule, wmbo_llm]
+  seeds: [0]
+  budget: 12
+  initial_samples: 10
+  shared_initial_design: sobol
+  candidate_pool_size: 256
+  output_dir: results/synthetic_bbob_llm_smoke_v4_flash
+
+benchmark_suite:
+  bbob:
+    functions: [1, 3]
+    dimensions: [5]
+    instances: [1, 2]
+
+optimizer:
+  options:
+    surrogate: gaussian_process
+    noise_level: 1.0e-6
+  wmbo_control:
+    candidate_options_per_strategy: 3
+    information_gain_weight: 0.35
+    gp_verifier_enabled: true
+
+llm:
+  enabled: true
+  provider: SiliconFlow
+  model: deepseek-ai/DeepSeek-V4-Flash
+  base_url: https://api.siliconflow.cn/v1
+  temperature: 0.0
+  fallback_to_rule: false
+  timeout: 30
+  max_retries: 1
+  retry_delay_seconds: 2
+
+execution:
+  continue_on_error: true
+  resume: true
+
+logging:
+  verbose: true

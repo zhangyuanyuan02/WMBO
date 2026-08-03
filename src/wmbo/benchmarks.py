@@ -7,6 +7,7 @@ import json
 import math
 from pathlib import Path
 import random
+import re
 from typing import Callable, Mapping, Sequence
 
 Vector = Sequence[float]
@@ -108,6 +109,24 @@ def list_benchmarks() -> list[str]:
     ]
 
 
+def expand_bbob_benchmarks(
+    functions: Sequence[int] = tuple(range(1, 25)),
+    dimensions: Sequence[int] = (5,),
+    instances: Sequence[int] = (1,),
+) -> list[str]:
+    """Expand a compact BBOB matrix into canonical benchmark names."""
+
+    function_ids = _validate_positive_unique_ints(functions, name="BBOB functions", maximum=24)
+    dims = _validate_positive_unique_ints(dimensions, name="BBOB dimensions")
+    instance_ids = _validate_positive_unique_ints(instances, name="BBOB instances")
+    return [
+        f"bbob_f{function_id:02d}_d{dim:02d}_i{instance:02d}"
+        for function_id in function_ids
+        for dim in dims
+        for instance in instance_ids
+    ]
+
+
 def get_benchmark(name: str) -> BenchmarkSpec:
     """Look up the specification for a benchmark.
 
@@ -120,6 +139,8 @@ def get_benchmark(name: str) -> BenchmarkSpec:
 
     key, dim_arg = _parse_benchmark_name(name)
 
+    if key.startswith("bbob_"):
+        return _get_bbob_benchmark(key)
     if key.startswith("opf_pglib_"):
         return _get_opf_benchmark(key)
 
@@ -317,6 +338,14 @@ def evaluate(request: EvaluationRequest) -> EvaluationResult:
         raw_options = request.options.get("opf", request.options)
         opf_options = raw_options if isinstance(raw_options, Mapping) else {}
         y, evaluation_metadata = evaluate_opf(spec.name, x_raw, opf_options)
+    elif spec.family == "bbob":
+        objective = _get_bbob_problem(spec)
+        y = float(objective(x_raw))
+        evaluation_metadata = {
+            "bbob_function": int(spec.metadata["function_id"]),
+            "bbob_instance": int(spec.metadata["instance"]),
+            "bbob_category": str(spec.metadata["category"]),
+        }
     else:
         objective = _get_objective(spec.name)
         y = objective(x_raw)
@@ -335,6 +364,103 @@ def evaluate(request: EvaluationRequest) -> EvaluationResult:
             **evaluation_metadata,
         },
     )
+
+
+_BBOB_NAME_RE = re.compile(r"^bbob_f(?P<function>\d{2})_d(?P<dim>\d+)_i(?P<instance>\d+)$")
+_BBOB_CATEGORIES = {
+    **{function_id: "separable" for function_id in range(1, 6)},
+    **{function_id: "moderate_conditioning" for function_id in range(6, 10)},
+    **{function_id: "high_conditioning_unimodal" for function_id in range(10, 15)},
+    **{function_id: "multimodal_global_structure" for function_id in range(15, 20)},
+    **{function_id: "multimodal_weak_structure" for function_id in range(20, 25)},
+}
+
+
+def _get_bbob_benchmark(name: str) -> BenchmarkSpec:
+    match = _BBOB_NAME_RE.fullmatch(name)
+    if match is None:
+        raise ValueError(
+            "Invalid BBOB benchmark name. Expected bbob_fXX_dYY_iZZ, "
+            f"got: {name}"
+        )
+    function_id = int(match.group("function"))
+    dim = int(match.group("dim"))
+    instance = int(match.group("instance"))
+    if function_id not in _BBOB_CATEGORIES or dim <= 0 or instance <= 0:
+        raise ValueError(f"Invalid BBOB benchmark parameters: {name}")
+
+    problem = _make_ioh_bbob_problem(function_id, dim, instance)
+    lower, upper = _ioh_bounds(problem, dim)
+    optimum = _ioh_optimum(problem)
+    category = _BBOB_CATEGORIES[function_id]
+    return BenchmarkSpec(
+        name=name,
+        dim=dim,
+        bounds=list(zip(lower, upper)),
+        optimum_value=optimum,
+        tags={
+            "suite": "BBOB",
+            "category": category,
+            "modality": "multimodal" if function_id >= 15 else "mostly_unimodal",
+            "anisotropy": "high" if 6 <= function_id <= 14 else "unknown",
+        },
+        family="bbob",
+        metadata={
+            "suite": "BBOB",
+            "function_id": function_id,
+            "instance": instance,
+            "category": category,
+            "ioh_version": _ioh_version(),
+        },
+    )
+
+
+def _get_bbob_problem(spec: BenchmarkSpec):
+    return _make_ioh_bbob_problem(
+        int(spec.metadata["function_id"]),
+        int(spec.dim),
+        int(spec.metadata["instance"]),
+    )
+
+
+def _make_ioh_bbob_problem(function_id: int, dim: int, instance: int):
+    try:
+        import ioh
+    except ImportError as exc:
+        raise RuntimeError(
+            "BBOB benchmarks require ioh==0.3.22; install the benchmark dependencies."
+        ) from exc
+    return ioh.get_problem(
+        int(function_id),
+        instance=int(instance),
+        dimension=int(dim),
+        problem_class=ioh.ProblemClass.BBOB,
+    )
+
+
+def _ioh_bounds(problem: object, dim: int) -> tuple[list[float], list[float]]:
+    bounds = getattr(problem, "bounds", None)
+    lower = getattr(bounds, "lb", None)
+    upper = getattr(bounds, "ub", None)
+    if lower is None or upper is None:
+        return [-5.0] * dim, [5.0] * dim
+    return [float(value) for value in lower], [float(value) for value in upper]
+
+
+def _ioh_optimum(problem: object) -> float:
+    optimum = getattr(problem, "optimum", None)
+    value = getattr(optimum, "y", None)
+    if value is None:
+        raise RuntimeError("IOH BBOB problem does not expose optimum.y")
+    return float(value)
+
+
+def _ioh_version() -> str:
+    try:
+        import ioh
+    except ImportError:
+        return "unavailable"
+    return str(getattr(ioh, "__version__", "unknown"))
 
 
 def _get_opf_benchmark(name: str) -> BenchmarkSpec:
@@ -442,6 +568,8 @@ def _validate_bounds(bounds: Bounds) -> list[tuple[float, float]]:
 
 def _parse_benchmark_name(name: str) -> tuple[str, int | None]:
     key = name.strip().lower()
+    if key.startswith("bbob_"):
+        return key, None
     for prefix in ("ackley", "rastrigin", "rosenbrock", "levy", "griewank", "styblinski"):
         if key.startswith(prefix):
             suffix = key[len(prefix) :]
@@ -454,6 +582,24 @@ def _parse_benchmark_name(name: str) -> tuple[str, int | None]:
                 raise ValueError("Benchmark dimension must be positive.")
             return prefix, dim
     return key, None
+
+
+def _validate_positive_unique_ints(
+    values: Sequence[int],
+    *,
+    name: str,
+    maximum: int | None = None,
+) -> list[int]:
+    parsed = [int(value) for value in values]
+    if not parsed:
+        raise ValueError(f"{name} must not be empty.")
+    if any(value <= 0 for value in parsed):
+        raise ValueError(f"{name} must contain positive integers.")
+    if maximum is not None and any(value > maximum for value in parsed):
+        raise ValueError(f"{name} values must not exceed {maximum}.")
+    if len(set(parsed)) != len(parsed):
+        raise ValueError(f"{name} must not contain duplicates.")
+    return parsed
 
 
 def _get_objective(name: str) -> ObjectiveFunction:
@@ -571,6 +717,7 @@ __all__ = [
     "EvaluationRequest",
     "EvaluationResult",
     "list_benchmarks",
+    "expand_bbob_benchmarks",
     "get_benchmark",
     "denormalise",
     "normalise",

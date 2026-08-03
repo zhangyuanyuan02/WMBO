@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Mapping, Sequence
+
+
+REGRET_FLOOR = 1.0e-12
+BBOB_TARGETS = tuple(10.0**exponent for exponent in range(2, -9, -1))
 
 
 @dataclass(frozen=True)
@@ -74,6 +79,48 @@ def simple_regret(best_values: Sequence[float], optimum_value: float | None) -> 
     return [max(0.0, float(best) - optimum) for best in best_values]
 
 
+def synthetic_run_metrics(
+    best_values: Sequence[float],
+    optimum_value: float,
+    initial_samples: int,
+    targets: Sequence[float] = BBOB_TARGETS,
+) -> dict[str, object]:
+    """Compute paper-facing anytime and target metrics for a synthetic run."""
+
+    regrets = [max(0.0, float(value) - float(optimum_value)) for value in best_values]
+    if not regrets:
+        return {}
+    initial_index = min(max(int(initial_samples), 1), len(regrets)) - 1
+    denominator = max(regrets[initial_index], REGRET_FLOOR)
+    post_initial = regrets[initial_index:]
+    relative = [min(1.0, max(0.0, value / denominator)) for value in post_initial]
+    final_regret = regrets[-1]
+    metrics: dict[str, object] = {
+        "log10_final_regret": math.log10(max(final_regret, REGRET_FLOOR)),
+        "relative_regret_auc": sum(relative) / len(relative),
+        "initial_design_regret": regrets[initial_index],
+        "post_initial_evaluations": len(post_initial),
+    }
+    target_hits = 0
+    target_progress = 0.0
+    for target in targets:
+        label = _target_label(float(target))
+        first = next((index for index, regret in enumerate(regrets, start=1) if regret <= target), None)
+        metrics[f"evals_to_target_{label}"] = first
+        metrics[f"success_target_{label}"] = first is not None
+        target_hits += int(first is not None)
+        if first is not None:
+            target_progress += 1.0 - (first - 1) / max(1, len(regrets))
+    metrics["target_success_rate"] = target_hits / len(tuple(targets))
+    metrics["target_auc"] = target_progress / len(tuple(targets))
+    return metrics
+
+
+def _target_label(target: float) -> str:
+    exponent = int(round(math.log10(target)))
+    return f"1e{exponent:+d}".replace("+", "p").replace("-", "m")
+
+
 def summarise_run(
     benchmark_name: str,
     method: str,
@@ -81,6 +128,7 @@ def summarise_run(
     values: Sequence[float],
     optimum_value: float | None = None,
     metadata: Mapping[str, object] | None = None,
+    initial_samples: int = 1,
 ) -> RunSummary:
     """Summarise one optimisation run.
 
@@ -101,6 +149,15 @@ def summarise_run(
     regret_curve = simple_regret(best_curve, optimum_value)
     final_best = best_curve[-1] if best_curve else None
     final_regret = regret_curve[-1] if regret_curve else None
+    extra = dict(metadata or {})
+    if optimum_value is not None:
+        extra.update(
+            synthetic_run_metrics(
+                best_curve,
+                optimum_value=float(optimum_value),
+                initial_samples=initial_samples,
+            )
+        )
     return RunSummary(
         benchmark_name=benchmark_name,
         method=method,
@@ -113,7 +170,7 @@ def summarise_run(
             "regret_curve": regret_curve,
             "first_value": objective_values[0] if objective_values else None,
             "last_value": objective_values[-1] if objective_values else None,
-            **dict(metadata or {}),
+            **extra,
         },
     )
 
@@ -122,5 +179,8 @@ __all__ = [
     "RunSummary",
     "cumulative_best",
     "simple_regret",
+    "synthetic_run_metrics",
+    "BBOB_TARGETS",
+    "REGRET_FLOOR",
     "summarise_run",
 ]

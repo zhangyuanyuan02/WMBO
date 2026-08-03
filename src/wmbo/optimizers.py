@@ -347,6 +347,163 @@ class EvolutionStrategyOptimizer:
         return append_observation(state, result)
 
 
+class TPESearchOptimizer:
+    """Optuna TPE baseline with a sequential ask/tell adapter."""
+
+    def __init__(self, config: OptimizerConfig) -> None:
+        self.config = config
+        self._study: Any | None = None
+        self._pending: Any | None = None
+        self._synced = 0
+
+    def _ensure_study(self, state: OptimizerState) -> None:
+        if self._study is not None:
+            return
+        try:
+            import optuna
+        except ImportError as exc:
+            raise RuntimeError("TPE requires optuna==4.9.0") from exc
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        sampler = optuna.samplers.TPESampler(
+            seed=self.config.seed,
+            multivariate=True,
+            n_startup_trials=0,
+        )
+        self._study = optuna.create_study(direction="minimize", sampler=sampler)
+        distributions = {
+            f"x_{index}": optuna.distributions.FloatDistribution(0.0, 1.0)
+            for index in range(state.benchmark.dim)
+        }
+        for observation in state.observations:
+            trial = optuna.trial.create_trial(
+                params={f"x_{index}": float(value) for index, value in enumerate(observation.x)},
+                distributions=distributions,
+                value=float(observation.y),
+            )
+            self._study.add_trial(trial)
+            self._synced += 1
+
+    def ask(self, state: OptimizerState) -> Vector:
+        _validate_state(state)
+        self._ensure_study(state)
+        self._pending = self._study.ask()
+        return [
+            float(self._pending.suggest_float(f"x_{index}", 0.0, 1.0))
+            for index in range(state.benchmark.dim)
+        ]
+
+    def tell(self, state: OptimizerState, result: EvaluationResult) -> OptimizerState:
+        if self._study is not None and self._pending is not None:
+            self._study.tell(self._pending, float(result.y))
+            self._pending = None
+            self._synced += 1
+        return append_observation(state, result)
+
+
+class CMAESOptimizer:
+    """pycma baseline adapted to the repository's one-point ask/tell loop."""
+
+    def __init__(self, config: OptimizerConfig) -> None:
+        self.config = config
+        self._strategy: Any | None = None
+        self._generation: list[list[float]] = []
+        self._values: list[float] = []
+        self._index = 0
+
+    def _ensure_strategy(self, state: OptimizerState) -> None:
+        if self._strategy is not None:
+            return
+        try:
+            import cma
+        except ImportError as exc:
+            raise RuntimeError("CMA-ES requires cma==4.4.4") from exc
+        best = best_observation(state.observations, constrained=False)
+        center = list(best.x) if best is not None else [0.5] * state.benchmark.dim
+        self._strategy = cma.CMAEvolutionStrategy(
+            center,
+            float(self.config.options.get("cma_sigma0", 0.3)),
+            {
+                "bounds": [0.0, 1.0],
+                "seed": int(self.config.seed),
+                "verbose": -9,
+                "verb_disp": 0,
+            },
+        )
+
+    def ask(self, state: OptimizerState) -> Vector:
+        _validate_state(state)
+        self._ensure_strategy(state)
+        if not self._generation or self._index >= len(self._generation):
+            self._generation = [
+                np.clip(np.asarray(candidate, dtype=float), 0.0, 1.0).tolist()
+                for candidate in self._strategy.ask()
+            ]
+            self._values = []
+            self._index = 0
+        return list(self._generation[self._index])
+
+    def tell(self, state: OptimizerState, result: EvaluationResult) -> OptimizerState:
+        if self._generation:
+            self._values.append(float(result.y))
+            self._index += 1
+            if self._index == len(self._generation):
+                self._strategy.tell(self._generation, self._values)
+        return append_observation(state, result)
+
+
+class HEBOOptimizer:
+    """Official HEBO baseline with warm-start ingestion."""
+
+    def __init__(self, config: OptimizerConfig) -> None:
+        self.config = config
+        self._optimizer: Any | None = None
+        self._pending: Any | None = None
+
+    def _ensure_optimizer(self, state: OptimizerState) -> None:
+        if self._optimizer is not None:
+            return
+        try:
+            import pandas as pd
+            from hebo.design_space.design_space import DesignSpace
+            from hebo.optimizers.hebo import HEBO
+        except ImportError as exc:
+            raise RuntimeError("HEBO requires HEBO==0.3.6 and its dependencies") from exc
+        space = DesignSpace().parse(
+            [
+                {"name": f"x_{index}", "type": "num", "lb": 0.0, "ub": 1.0}
+                for index in range(state.benchmark.dim)
+            ]
+        )
+        self._optimizer = HEBO(space, rand_sample=0)
+        if state.observations:
+            frame = pd.DataFrame(
+                [
+                    {f"x_{index}": float(value) for index, value in enumerate(observation.x)}
+                    for observation in state.observations
+                ]
+            )
+            values = np.asarray([observation.y for observation in state.observations], dtype=float).reshape(-1, 1)
+            self._optimizer.observe(frame, values)
+
+    def ask(self, state: OptimizerState) -> Vector:
+        _validate_state(state)
+        self._ensure_optimizer(state)
+        self._pending = self._optimizer.suggest(n_suggestions=1)
+        return [
+            float(self._pending.iloc[0][f"x_{index}"])
+            for index in range(state.benchmark.dim)
+        ]
+
+    def tell(self, state: OptimizerState, result: EvaluationResult) -> OptimizerState:
+        if self._optimizer is not None and self._pending is not None:
+            self._optimizer.observe(
+                self._pending,
+                np.asarray([[float(result.y)]], dtype=float),
+            )
+            self._pending = None
+        return append_observation(state, result)
+
+
 class WMBOOptimizer:
     """Rule-based world-model black-box optimiser.
 
@@ -444,15 +601,35 @@ class WMBOOptimizer:
             seed=self.config.seed + 20_000 + state.step,
         )
         descriptor_prediction = surrogate.predict(descriptor_pool)
-        descriptor = describe_landscape(
-            observed_x=observed_x.tolist(),
-            observed_y=observed_y.tolist(),
-            surrogate_metadata={
-                **dict(descriptor_prediction.metadata),
-                "mean_std": float(np.mean(descriptor_prediction.std)) if descriptor_prediction.std else 1.0,
-            },
-        )
+        if _truthy(self.config.options.get("disable_world_model_descriptor", False)):
+            descriptor = LandscapeDescriptor(
+                dim=state.benchmark.dim,
+                num_observations=len(observed_y),
+                best_y=float(np.min(observed_y)),
+                y_range=float(np.max(observed_y) - np.min(observed_y)),
+                uncertainty=1.0,
+                labels={
+                    "smoothness": "unknown",
+                    "modality": "unknown",
+                    "curvature": "unknown",
+                    "anisotropy": "unknown",
+                },
+                calibration={"world_model_entropy": 0.0},
+            )
+        else:
+            descriptor = describe_landscape(
+                observed_x=observed_x.tolist(),
+                observed_y=observed_y.tolist(),
+                surrogate_metadata={
+                    **dict(descriptor_prediction.metadata),
+                    "mean_std": float(np.mean(descriptor_prediction.std)) if descriptor_prediction.std else 1.0,
+                },
+            )
         phase = self._control.budget_phase(state.step, self.config.budget)
+        hypothesis_tracking = not _truthy(
+            self.config.options.get("disable_hypothesis_tracking", False)
+        )
+        active_hypotheses = self._control.hypothesis_summary() if hypothesis_tracking else []
         candidate_options = _build_strategy_candidate_options(
             surrogate=surrogate,
             observed_x=observed_x,
@@ -462,8 +639,12 @@ class WMBOOptimizer:
             n_options_per_strategy=max(1, int(self._control.config.candidate_options_per_strategy)),
             seed=self.config.seed + 25_000 + state.step,
             phase=phase,
-            active_hypotheses=self._control.hypothesis_summary(),
-            hypothesis_alignment_weight=float(self._control.config.hypothesis_alignment_weight),
+            active_hypotheses=active_hypotheses,
+            hypothesis_alignment_weight=(
+                float(self._control.config.hypothesis_alignment_weight)
+                if hypothesis_tracking
+                else 0.0
+            ),
             information_gain_weight=float(self._control.config.information_gain_weight),
             world_model_entropy=float(descriptor.calibration.get("world_model_entropy", 1.0)),
             constraint_surrogate=constraint_surrogate,
@@ -519,20 +700,24 @@ class WMBOOptimizer:
             trial_number=state.step + 1,
             hypothesis_window=int(self._control.config.hypothesis_window),
         )
-        hypothesis_record = self._control.create_hypothesis(
-            text=decision.hypothesis,
-            strategy=executed_strategy,
-            trial_number=state.step + 1,
-            baseline_best=(
-                _constraint_progress_value(state.observations, constrained=constrained)
-                if state.observations
-                else float(np.min(observed_y))
-            ),
-            confidence=structured_hypothesis["confidence"],
-            region_center=structured_hypothesis["region_center"],
-            region_radius=structured_hypothesis["region_radius"],
-            sensitive_dims=structured_hypothesis["sensitive_dims"],
-            falsification_rule=structured_hypothesis["falsification_rule"],
+        hypothesis_record = (
+            self._control.create_hypothesis(
+                text=decision.hypothesis,
+                strategy=executed_strategy,
+                trial_number=state.step + 1,
+                baseline_best=(
+                    _constraint_progress_value(state.observations, constrained=constrained)
+                    if state.observations
+                    else float(np.min(observed_y))
+                ),
+                confidence=structured_hypothesis["confidence"],
+                region_center=structured_hypothesis["region_center"],
+                region_radius=structured_hypothesis["region_radius"],
+                sensitive_dims=structured_hypothesis["sensitive_dims"],
+                falsification_rule=structured_hypothesis["falsification_rule"],
+            )
+            if hypothesis_tracking
+            else None
         )
 
         self._pending_trial = {
@@ -549,6 +734,11 @@ class WMBOOptimizer:
         }
         self._last_decision = {
             **decision.to_dict(),
+            **{
+                key: value
+                for key, value in dict(decision.metadata).items()
+                if str(key).startswith("llm_")
+            },
             "proposed_strategy": decision.strategy,
             "executed_strategy": executed_strategy,
             "override_reason": override_reason,
@@ -637,7 +827,11 @@ class WMBOOptimizer:
             "consecutive_no_improvement": self._control.consecutive_no_improvement,
             "strategy_trust": dict(self._control.trusts),
             "strategy_success_rates": self._control.recent_success_rates(),
-            "recent_hypotheses": self._control.hypothesis_summary(),
+            "recent_hypotheses": (
+                []
+                if _truthy(self.config.options.get("disable_hypothesis_tracking", False))
+                else self._control.hypothesis_summary()
+            ),
             "feasible_observations": sum(
                 bool(item.metadata.get("feasible", False))
                 for item in state.observations
@@ -782,7 +976,7 @@ def make_optimizer(method: str, config: OptimizerConfig) -> Optimizer:
         Object implementing the ``Optimizer`` protocol.
     """
 
-    name = method.strip().lower().replace("-", "_")
+    name = str(config.options.get("base_method") or method).strip().lower().replace("-", "_")
     if name in {"random", "random_search"}:
         return RandomSearchOptimizer(config)
     if name in {"sobol", "sobol_search", "quasi_random"}:
@@ -795,9 +989,36 @@ def make_optimizer(method: str, config: OptimizerConfig) -> Optimizer:
         return BayesianOptimizationOptimizer(config, acquisition_strategy="lower_confidence_bound")
     if name in {"es", "simple_es", "evolution", "evolution_strategy"}:
         return EvolutionStrategyOptimizer(config)
+    if name in {"tpe", "optuna_tpe"}:
+        return TPESearchOptimizer(config)
+    if name in {"cma", "cma_es", "cmaes"}:
+        return CMAESOptimizer(config)
+    if name in {"hebo"}:
+        return HEBOOptimizer(config)
+    if name == "wmbo_rule":
+        return WMBOOptimizer(_config_with_options(config, use_llm_agent=False))
+    if name == "wmbo_llm":
+        return WMBOOptimizer(
+            _config_with_options(
+                config,
+                use_llm_agent=True,
+                llm_fallback_to_rule=False,
+            )
+        )
     if name in {"wmbo", "world_model", "world_model_bo"}:
         return WMBOOptimizer(config)
     raise ValueError(f"Unknown optimiser method: {method}")
+
+
+def _config_with_options(config: OptimizerConfig, **updates: object) -> OptimizerConfig:
+    return OptimizerConfig(
+        method=config.method,
+        budget=config.budget,
+        initial_samples=config.initial_samples,
+        candidate_pool_size=config.candidate_pool_size,
+        seed=config.seed,
+        options={**dict(config.options), **updates},
+    )
 
 
 def create_initial_state(benchmark: BenchmarkSpec) -> OptimizerState:

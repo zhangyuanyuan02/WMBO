@@ -8,6 +8,7 @@ from typing import Any, Mapping, Sequence
 import yaml
 
 from .control import OptimizerConfig, RunConfig
+from .benchmarks import expand_bbob_benchmarks
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
@@ -49,7 +50,16 @@ def run_config_from_mapping(data: Mapping[str, Any]) -> RunConfig:
         section="llm",
     )
 
-    benchmarks = _as_str_list(suite.get("benchmarks", data.get("benchmarks", ["branin"])))
+    explicit_benchmarks = suite.get("benchmarks", data.get("benchmarks"))
+    benchmarks = _as_str_list(explicit_benchmarks) if explicit_benchmarks is not None else []
+    bbob_section = _mapping(suite.get("bbob", {}), section="benchmark_suite.bbob")
+    if bbob_section:
+        functions = _as_int_list(bbob_section.get("functions", list(range(1, 25))))
+        dimensions = _as_int_list(bbob_section.get("dimensions", [5]))
+        instances = _as_int_list(bbob_section.get("instances", [1]))
+        benchmarks.extend(expand_bbob_benchmarks(functions, dimensions, instances))
+    if not benchmarks:
+        benchmarks = ["branin"]
     methods = _as_str_list(experiment.get("methods", data.get("methods", ["random"])))
     seeds = _as_int_list(experiment.get("seeds", data.get("seeds", [0])))
     budget = _positive_int(experiment.get("budget", data.get("budget", 20)), name="budget")
@@ -67,6 +77,25 @@ def run_config_from_mapping(data: Mapping[str, Any]) -> RunConfig:
     )
     output_dir = str(experiment.get("output_dir", data.get("output_dir", "results")))
     options = dict(_mapping(optimizer_section.get("options", {}), section="optimizer.options"))
+    for key in (
+        "budget_per_dimension",
+        "initial_samples_per_dimension",
+        "shared_initial_design",
+    ):
+        if key in experiment and experiment[key] is not None:
+            options[key] = experiment[key]
+    method_options = _mapping(optimizer_section.get("method_options", {}), section="optimizer.method_options")
+    if method_options:
+        options["method_options"] = {
+            str(method): dict(_mapping(value, section=f"optimizer.method_options.{method}"))
+            for method, value in method_options.items()
+        }
+    execution_section = _mapping(data.get("execution", {}), section="execution")
+    reporting_section = _mapping(data.get("reporting", {}), section="reporting")
+    if execution_section:
+        options["execution"] = dict(execution_section)
+    if reporting_section:
+        options["reporting"] = dict(reporting_section)
     if logging_section:
         options["logging"] = dict(logging_section)
     llm_options = _normalise_llm_options(llm_section)

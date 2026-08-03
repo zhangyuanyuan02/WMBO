@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import tempfile
 from typing import Any, Sequence
 
 
@@ -52,8 +54,24 @@ def write_json(path: str | Path, data: Any) -> None:
 
     destination = Path(path)
     ensure_dir(destination.parent)
-    with destination.open("w", encoding="utf-8") as file:
-        json.dump(data, file, indent=2, ensure_ascii=False)
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        dir=str(destination.parent),
+        text=True,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+            json.dump(data, file, indent=2, ensure_ascii=False)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp_name, destination)
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
 
 
 def parse_csv(value: str | None) -> list[str] | None:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 import math
 import os
@@ -28,6 +28,10 @@ WORLD_MODEL_LABELS: dict[str, set[str]] = {
 
 class LLMAPIError(RuntimeError):
     """Raised when a remote LLM call or response parse fails."""
+
+    def __init__(self, message: str, *, telemetry: Mapping[str, Any] | None = None):
+        super().__init__(message)
+        self.telemetry = dict(telemetry or {})
 
 
 def _candidate_secret_paths() -> list[Path]:
@@ -125,6 +129,7 @@ class LLMClientConfig:
     """Configuration for an OpenAI-compatible chat-completions endpoint."""
 
     api_key: str | None = None
+    api_key_env: str | None = None
     base_url: str = "https://api.openai.com/v1"
     default_model: str = "gpt-4o-mini"
     timeout: float = 120.0
@@ -141,6 +146,7 @@ class LLMClientConfig:
         local = load_local_llm_config()
         return cls(
             api_key=os.getenv("OPENAI_API_KEY") or local.get("api_key"),
+            api_key_env=str(local.get("api_key_env") or "OPENAI_API_KEY"),
             base_url=os.getenv("OPENAI_BASE_URL") or str(local.get("base_url", "https://api.openai.com/v1")),
             default_model=os.getenv("OPENAI_MODEL") or str(local.get("model", "gpt-4o-mini")),
             timeout=float(os.getenv("OPENAI_TIMEOUT") or local.get("timeout", 120)),
@@ -168,6 +174,7 @@ class LLMClientConfig:
                 api_key = key_env_text
         return cls(
             api_key=str(api_key) if api_key else os.getenv("OPENAI_API_KEY"),
+            api_key_env=str(key_env) if key_env else "OPENAI_API_KEY",
             base_url=str(merged.get("base_url") or merged.get("api_base_url") or os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")),
             default_model=str(merged.get("model") or merged.get("api_model") or os.getenv("OPENAI_MODEL", "gpt-4o-mini")),
             timeout=float(merged.get("timeout", os.getenv("OPENAI_TIMEOUT", "120"))),
@@ -231,6 +238,7 @@ class OpenAIStyleClient:
         cfg = config or LLMClientConfig.from_env()
         self.config = LLMClientConfig(
             api_key=api_key if api_key is not None else cfg.api_key,
+            api_key_env=cfg.api_key_env,
             base_url=base_url if base_url is not None else cfg.base_url,
             default_model=default_model if default_model is not None else cfg.default_model,
             timeout=timeout if timeout is not None else cfg.timeout,
@@ -254,7 +262,17 @@ class OpenAIStyleClient:
         """POST JSON to the configured API endpoint with retry handling."""
 
         if not self.config.api_key:
-            raise LLMAPIError("Missing API key. Set OPENAI_API_KEY or pass api_key/API key env in options.")
+            raise LLMAPIError(
+                f"Missing API key. Set {self.config.api_key_env or 'OPENAI_API_KEY'} "
+                "or pass api_key/API key env in options.",
+                telemetry={
+                    "model": payload.get("model"),
+                    "calls": 0,
+                    "attempts": 0,
+                    "retries": 0,
+                    "latency_seconds": 0.0,
+                },
+            )
 
         url = self.config.base_url.rstrip("/") + "/" + path.lstrip("/")
         headers = {
@@ -270,6 +288,7 @@ class OpenAIStyleClient:
         body = json.dumps(dict(payload), ensure_ascii=False).encode("utf-8")
         attempts = max(1, int(self.config.max_retries) + 1)
         last_error: Exception | None = None
+        started = time.perf_counter()
         for attempt in range(1, attempts + 1):
             try:
                 response = requests.post(url, data=body, headers=headers, timeout=self.config.timeout)
@@ -277,7 +296,14 @@ class OpenAIStyleClient:
                     if self.config.request_delay_seconds > 0:
                         time.sleep(float(self.config.request_delay_seconds))
                     try:
-                        return response.json()
+                        parsed = response.json()
+                        if not isinstance(parsed, dict):
+                            raise LLMAPIError("LLM API returned a non-object JSON response.")
+                        parsed["_wmbo_transport"] = {
+                            "latency_seconds": time.perf_counter() - started,
+                            "attempts": attempt,
+                        }
+                        return parsed
                     except requests.exceptions.JSONDecodeError as exc:
                         preview = response.text[:500].replace("\n", "\\n")
                         raise LLMAPIError(f"LLM API returned non-JSON response: {preview!r}") from exc
@@ -285,7 +311,15 @@ class OpenAIStyleClient:
                 retryable = response.status_code == 429 or response.status_code >= 500
                 if not retryable or attempt == attempts:
                     raise LLMAPIError(
-                        f"LLM API request failed with HTTP {response.status_code} at {url}: {response.text[:1000]}"
+                        f"LLM API request failed with HTTP {response.status_code} at {url}: {response.text[:1000]}",
+                        telemetry={
+                            "model": payload.get("model"),
+                            "calls": 1,
+                            "attempts": attempt,
+                            "retries": max(0, attempt - 1),
+                            "latency_seconds": time.perf_counter() - started,
+                            "http_status": response.status_code,
+                        },
                     )
                 retry_after = response.headers.get("Retry-After")
                 delay = _parse_retry_after(retry_after, fallback=self.config.retry_delay_seconds * attempt)
@@ -294,7 +328,16 @@ class OpenAIStyleClient:
             except requests.exceptions.RequestException as exc:
                 last_error = exc
                 if attempt == attempts:
-                    raise LLMAPIError(f"LLM API request failed after {attempts} attempt(s): {exc}") from exc
+                    raise LLMAPIError(
+                        f"LLM API request failed after {attempts} attempt(s): {exc}",
+                        telemetry={
+                            "model": payload.get("model"),
+                            "calls": 1,
+                            "attempts": attempt,
+                            "retries": max(0, attempt - 1),
+                            "latency_seconds": time.perf_counter() - started,
+                        },
+                    ) from exc
                 time.sleep(float(self.config.retry_delay_seconds) * attempt)
 
         raise LLMAPIError(f"LLM API request failed: {last_error}")
@@ -627,7 +670,41 @@ def decide_with_llm(
         print(f"[LLM thinking] present={has_reasoning}, reasoning_tokens={token_text}")
         print("[LLM output]")
         print(text)
-    return parse_reasoning_decision(text)
+    decision = parse_reasoning_decision(text)
+    usage = response.get("usage", {})
+    usage = usage if isinstance(usage, Mapping) else {}
+    transport = response.get("_wmbo_transport", {})
+    transport = transport if isinstance(transport, Mapping) else {}
+    telemetry = {
+        "llm_model": str(response.get("model") or model or client.config.default_model),
+        "llm_calls": 1,
+        "llm_prompt_tokens": _optional_int(usage.get("prompt_tokens") or usage.get("input_tokens")),
+        "llm_completion_tokens": _optional_int(usage.get("completion_tokens") or usage.get("output_tokens")),
+        "llm_reasoning_tokens": reasoning_tokens,
+        "llm_total_tokens": _optional_int(usage.get("total_tokens")),
+        "llm_latency_seconds": _optional_float(transport.get("latency_seconds")),
+        "llm_attempts": _optional_int(transport.get("attempts")) or 1,
+    }
+    return replace(decision, metadata={**dict(decision.metadata), **telemetry})
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def available_api_providers() -> list[str]:

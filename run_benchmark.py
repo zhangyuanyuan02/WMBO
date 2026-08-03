@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
+import json
 from pathlib import Path
 import sys
 
@@ -16,7 +17,8 @@ from wmbo.benchmarks import list_benchmarks
 from wmbo.config import default_run_config, load_run_config, merge_run_config
 from wmbo.control import OptimizerConfig, RunConfig
 from wmbo.llm_api import API_PROVIDER_ENV, available_api_providers
-from wmbo.runner import run_benchmark_suite
+from wmbo.analysis import generate_synthetic_report
+from wmbo.runner import describe_benchmark_suite, run_benchmark_suite
 from wmbo.utils import parse_csv, parse_int_csv
 
 
@@ -49,6 +51,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--llm-temperature", type=float, default=None, help="LLM sampling temperature.")
     parser.add_argument("--llm-log-io", action="store_true", help="Print LLM request and response payloads for debugging.")
     parser.add_argument("--no-llm-fallback", action="store_true", help="Raise LLM errors instead of falling back to the rule agent.")
+    parser.add_argument("--dry-run", action="store_true", help="Print the expanded suite size without running evaluations.")
+    parser.add_argument("--resume", action="store_true", help="Resume matching completed runs from the output directory.")
+    parser.add_argument("--continue-on-error", action="store_true", help="Record failed runs and continue the suite.")
+    parser.add_argument("--workers", type=int, default=None, help="Parallel worker processes; overrides execution.workers.")
+    parser.add_argument("--report-only", action="store_true", help="Regenerate the synthetic paper report from saved results.")
     return parser
 
 
@@ -147,7 +154,24 @@ def main() -> None:
         os.environ[API_PROVIDER_ENV] = args.api_provider
         print(f"[llm] api_provider={args.api_provider}")
     config = build_run_config(args)
-    results = run_benchmark_suite(config)
+    if args.dry_run:
+        estimate = describe_benchmark_suite(config)
+        print(json.dumps(estimate, indent=2))
+        return
+    if args.report_only:
+        generated = generate_synthetic_report(config.output_dir)
+        print(f"generated {len(generated)} report artifacts under {config.output_dir}")
+        return
+    execution = config.optimizer.options.get("execution", {})
+    execution = execution if isinstance(execution, dict) else {}
+    results = run_benchmark_suite(
+        config,
+        resume=bool(args.resume or execution.get("resume", False)),
+        continue_on_error=bool(
+            args.continue_on_error or execution.get("continue_on_error", False)
+        ),
+        workers=args.workers,
+    )
 
     print("completed benchmark runs:")
     for result in results:
@@ -170,6 +194,9 @@ def main() -> None:
             )
         )
     print(f"saved results to: {config.output_dir}")
+    if any(str(name).startswith("bbob_") for name in config.benchmarks):
+        generated = generate_synthetic_report(config.output_dir)
+        print(f"generated {len(generated)} paper-report artifacts")
 
 
 if __name__ == "__main__":
