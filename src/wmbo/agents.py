@@ -9,6 +9,7 @@ from typing import Mapping, Sequence
 import numpy as np
 
 from .control import STRATEGIES
+from .portfolio import PORTFOLIO_STRATEGIES
 
 Vector = Sequence[float]
 Matrix = Sequence[Vector]
@@ -62,6 +63,7 @@ class RulePolicyConfig:
 
     mode: str = "legacy_v1"
     landscape_weight: float = 0.45
+    geometry_weight: float = 0.0
     candidate_weight: float = 0.35
     history_weight: float = 0.20
     temperature: float = 0.20
@@ -69,21 +71,40 @@ class RulePolicyConfig:
     @classmethod
     def from_mapping(cls, value: Mapping[str, object] | None) -> RulePolicyConfig:
         raw = dict(value or {})
+        mode = str(raw.get("mode", cls.mode)).strip().lower()
+        defaults = (
+            {
+                "landscape_weight": 0.25,
+                "geometry_weight": 0.30,
+                "candidate_weight": 0.30,
+                "history_weight": 0.15,
+            }
+            if mode == "portfolio_v5"
+            else {
+                "landscape_weight": cls.landscape_weight,
+                "geometry_weight": cls.geometry_weight,
+                "candidate_weight": cls.candidate_weight,
+                "history_weight": cls.history_weight,
+            }
+        )
         config = cls(
-            mode=str(raw.get("mode", cls.mode)).strip().lower(),
-            landscape_weight=float(raw.get("landscape_weight", cls.landscape_weight)),
-            candidate_weight=float(raw.get("candidate_weight", cls.candidate_weight)),
-            history_weight=float(raw.get("history_weight", cls.history_weight)),
+            mode=mode,
+            landscape_weight=float(raw.get("landscape_weight", defaults["landscape_weight"])),
+            geometry_weight=float(raw.get("geometry_weight", defaults["geometry_weight"])),
+            candidate_weight=float(raw.get("candidate_weight", defaults["candidate_weight"])),
+            history_weight=float(raw.get("history_weight", defaults["history_weight"])),
             temperature=float(raw.get("temperature", cls.temperature)),
         )
         if config.mode not in {
-            "legacy_v1", "continuous_v2", "continuous_v3", "continuous_v4"
+            "legacy_v1", "continuous_v2", "continuous_v3", "continuous_v4", "portfolio_v5"
         }:
-            raise ValueError(
-                "rule_policy.mode must be legacy_v1, continuous_v2, continuous_v3, "
-                "or continuous_v4."
-            )
-        weights = (config.landscape_weight, config.candidate_weight, config.history_weight)
+            raise ValueError("unsupported rule_policy.mode.")
+        weights = (
+            config.landscape_weight,
+            config.geometry_weight,
+            config.candidate_weight,
+            config.history_weight,
+        )
         if any(not math.isfinite(weight) or weight < 0.0 for weight in weights):
             raise ValueError("rule policy weights must be finite and non-negative.")
         if sum(weights) <= 0.0:
@@ -258,6 +279,8 @@ class WorldModelAgent:
             raise ValueError("budget_total must be positive.")
         if state.budget_used < 0:
             raise ValueError("budget_used must be non-negative.")
+        if self.config.mode == "portfolio_v5":
+            return self._decide_portfolio(state)
         if self.config.mode in {"continuous_v2", "continuous_v3", "continuous_v4"}:
             return self._decide_continuous(state)
         return self._decide_legacy(state)
@@ -364,6 +387,187 @@ class WorldModelAgent:
             },
         )
 
+    def _decide_portfolio(self, state: AgentState) -> ReasoningDecision:
+        """Score the five heterogeneous v5 operators at a macro boundary."""
+
+        descriptor = dict(state.descriptor)
+        labels = dict(descriptor.get("labels", {}) or {})
+        context = dict(state.decision_context)
+        progress = float(np.clip(state.budget_used / state.budget_total, 0.0, 1.0))
+        uncertainty = _bounded(descriptor.get("uncertainty"), 1.0)
+        coverage = _bounded(descriptor.get("coverage"), 0.0)
+        stagnation = _bounded(descriptor.get("stagnation"), 1.0)
+        recent_gain = _normalised_recent_improvement(state.observed_y)
+        entropy = _bounded(
+            dict(descriptor.get("calibration", {}) or {}).get("world_model_entropy"), 1.0
+        )
+        landscape_scores = {
+            "global_sobol": float(np.mean([1.0 - progress, 1.0 - coverage, uncertainty])),
+            "gp_ucb": float(np.mean([uncertainty, entropy, stagnation, 1.0 - 0.5 * progress])),
+            "gp_ei": float(np.mean([progress, coverage, 1.0 - uncertainty, recent_gain])),
+            "anisotropic_turbo": float(
+                np.mean([coverage, 1.0 - uncertainty, recent_gain, 1.0 - abs(progress - 0.65)])
+            ),
+            "cma_local": float(np.mean([progress, coverage, 1.0 - uncertainty, recent_gain])),
+        }
+
+        posteriors = {
+            name: _bounded(
+                dict(descriptor.get("regime_posteriors", {}) or {}).get(name), 0.2
+            )
+            for name in (
+                "separable_smooth",
+                "rotated_ill_conditioned",
+                "curved_valley",
+                "rugged_multimodal",
+                "weakly_identified",
+            )
+        }
+        posterior_values = np.asarray(list(posteriors.values()), dtype=float)
+        posterior_values /= max(float(np.sum(posterior_values)), 1e-12)
+        regime_entropy = float(
+            -np.sum(posterior_values * np.log(np.clip(posterior_values, 1e-12, 1.0)))
+            / math.log(len(posterior_values))
+        )
+        geometry_scores = {
+            "global_sobol": 0.5 * regime_entropy + 0.5 * posteriors["weakly_identified"],
+            "gp_ucb": 0.5 * posteriors["weakly_identified"] + 0.5 * posteriors["rugged_multimodal"],
+            "gp_ei": posteriors["separable_smooth"],
+            "anisotropic_turbo": (
+                0.6 * posteriors["curved_valley"]
+                + 0.4 * posteriors["rotated_ill_conditioned"]
+            ),
+            "cma_local": (
+                0.75 * posteriors["rotated_ill_conditioned"]
+                + 0.25 * posteriors["curved_valley"]
+            ),
+        }
+        candidate_scores, best_options, candidate_components = _portfolio_candidate_evidence(
+            state.candidate_options
+        )
+        trusts = dict(context.get("strategy_trust", {}) or {})
+        history_scores = {
+            strategy: _bounded(trusts.get(strategy), 0.5)
+            for strategy in PORTFOLIO_STRATEGIES
+        }
+        weights = np.asarray(
+            [
+                self.config.landscape_weight,
+                self.config.geometry_weight,
+                self.config.candidate_weight,
+                self.config.history_weight,
+            ],
+            dtype=float,
+        )
+        weights /= max(float(np.sum(weights)), 1e-12)
+        raw_scores = {
+            strategy: float(
+                weights[0] * landscape_scores[strategy]
+                + weights[1] * geometry_scores[strategy]
+                + weights[2] * candidate_scores[strategy]
+                + weights[3] * history_scores[strategy]
+            )
+            for strategy in PORTFOLIO_STRATEGIES
+        }
+
+        configured_allowed = context.get("allowed_strategies")
+        allowed = (
+            {
+                str(strategy)
+                for strategy in configured_allowed
+                if str(strategy) in PORTFOLIO_STRATEGIES
+            }
+            if isinstance(configured_allowed, Sequence)
+            and not isinstance(configured_allowed, (str, bytes, bytearray))
+            else set(PORTFOLIO_STRATEGIES)
+        )
+        if not allowed:
+            allowed = {"gp_ei", "anisotropic_turbo"}
+        forced = str(context.get("forced_strategy") or "")
+        if forced not in allowed:
+            forced = ""
+        strategy = forced or max(
+            (item for item in PORTFOLIO_STRATEGIES if item in allowed),
+            key=lambda item: raw_scores[item],
+        )
+        selected = best_options.get(strategy)
+        selected_candidate_id = (
+            str(selected.get("candidate_id"))
+            if selected is not None and selected.get("candidate_id") is not None
+            else None
+        )
+        hypotheses = {
+            "global_sobol": "Global Sobol coverage should reduce weak identification of the landscape.",
+            "gp_ucb": "A globally uncertain or rugged regime favours GP-UCB information gathering.",
+            "gp_ei": "A separable, sufficiently identified regime favours global expected improvement.",
+            "anisotropic_turbo": "The evidence supports a rotated or curved local valley for ellipsoidal TuRBO.",
+            "cma_local": "The local basin appears rotated and ill-conditioned enough for covariance adaptation.",
+        }
+        rationales = {
+            "global_sobol": "Regime entropy, novelty, and information gain favour global coverage.",
+            "gp_ucb": "Weak identification, ruggedness, and surrogate uncertainty favour GP-UCB.",
+            "gp_ei": "Smooth separability, coverage, and expected improvement favour GP-EI.",
+            "anisotropic_turbo": "Valley geometry and rotated local covariance favour anisotropic TuRBO.",
+            "cma_local": "Ill-conditioned rotated geometry favours local covariance adaptation.",
+        }
+        confidence = _score_confidence(
+            scores=[raw_scores[item] for item in PORTFOLIO_STRATEGIES if item in allowed],
+            descriptor=descriptor,
+            temperature=self.config.temperature,
+            forced=bool(forced),
+        )
+        return ReasoningDecision(
+            strategy=strategy,
+            hypothesis=hypotheses[strategy],
+            confidence=confidence,
+            rationale=rationales[strategy],
+            world_model={
+                name: str(labels.get(name, "unknown"))
+                for name in ("smoothness", "modality", "curvature", "anisotropy")
+            },
+            selected_candidate_id=selected_candidate_id,
+            metadata={
+                "labels": labels,
+                "budget_used": state.budget_used,
+                "budget_total": state.budget_total,
+                "remaining_ratio": 1.0 - progress,
+                "strategy_scores": {
+                    item: raw_scores[item] if item in allowed else None
+                    for item in PORTFOLIO_STRATEGIES
+                },
+                "score_components": {
+                    item: {
+                        "landscape": landscape_scores[item],
+                        "geometry": geometry_scores[item],
+                        "candidate": candidate_scores[item],
+                        "history": history_scores[item],
+                        "candidate_evidence": candidate_components[item],
+                    }
+                    for item in PORTFOLIO_STRATEGIES
+                },
+                "geometry_features": {
+                    key: descriptor.get(key)
+                    for key in (
+                        "lengthscale_condition", "local_condition", "rotation_score",
+                        "effective_dimension", "valley_score",
+                    )
+                },
+                "regime_posteriors": posteriors,
+                "allowed_strategies": [
+                    item for item in PORTFOLIO_STRATEGIES if item in allowed
+                ],
+                "masked_strategies": [
+                    item for item in PORTFOLIO_STRATEGIES if item not in allowed
+                ],
+                "forced_strategy": forced or None,
+                "forced_reason": context.get("forced_reason") if forced else None,
+                "gate_reasons": list(context.get("gate_reasons", []) or []),
+                "selected_candidate_evidence": dict(selected) if selected is not None else None,
+                "source": "rule",
+                "rule_policy_mode": self.config.mode,
+                "budget_phase": str(context.get("budget_phase") or _phase_from_progress(progress)),
+            },
+        )
     def _decide_continuous(self, state: AgentState) -> ReasoningDecision:
         descriptor = dict(state.descriptor)
         labels = dict(descriptor.get("labels", {}) or {})
@@ -715,6 +919,103 @@ def _candidate_evidence(
     return {key: float(value) for key, value in scores.items()}, best, components
 
 
+def _portfolio_candidate_evidence(
+    candidates: Sequence[Mapping[str, object]],
+) -> tuple[
+    dict[str, float],
+    dict[str, Mapping[str, object]],
+    dict[str, dict[str, float]],
+]:
+    """Normalise evidence once across the five heterogeneous operator pools."""
+
+    best: dict[str, Mapping[str, object]] = {}
+    for strategy in PORTFOLIO_STRATEGIES:
+        matching = [
+            candidate
+            for candidate in candidates
+            if str(candidate.get("strategy", "")) == strategy
+        ]
+        if matching:
+            best[strategy] = max(
+                matching,
+                key=lambda candidate: (
+                    _finite_float(
+                        candidate.get("selection_score", candidate.get("acquisition_score")),
+                        float("-inf"),
+                    ),
+                    str(candidate.get("candidate_id", "")),
+                ),
+            )
+    feature_names = ("ei", "information", "novelty", "std", "pof", "confirmation")
+    raw = {name: {} for name in feature_names}
+    for strategy in PORTFOLIO_STRATEGIES:
+        option = best.get(strategy, {})
+        raw["ei"][strategy] = _finite_float(
+            option.get("constrained_expected_improvement", option.get("expected_improvement"))
+        )
+        raw["information"][strategy] = _finite_float(option.get("information_gain"))
+        raw["novelty"][strategy] = _finite_float(
+            option.get("distance_to_nearest_observation")
+        )
+        raw["std"][strategy] = _finite_float(option.get("surrogate_std"))
+        raw["pof"][strategy] = _finite_float(option.get("probability_feasible"), 1.0)
+        raw["confirmation"][strategy] = _finite_float(option.get("confirmation_value"))
+    scaled = {
+        name: _normalise_feature_for(raw[name], PORTFOLIO_STRATEGIES)
+        for name in feature_names
+    }
+    components = {
+        strategy: {name: scaled[name][strategy] for name in feature_names}
+        for strategy in PORTFOLIO_STRATEGIES
+    }
+    scores = {
+        "global_sobol": (
+            0.35 * scaled["novelty"]["global_sobol"]
+            + 0.35 * scaled["information"]["global_sobol"]
+            + 0.20 * scaled["std"]["global_sobol"]
+            + 0.10 * scaled["pof"]["global_sobol"]
+        ),
+        "gp_ucb": (
+            0.40 * scaled["std"]["gp_ucb"]
+            + 0.30 * scaled["information"]["gp_ucb"]
+            + 0.15 * scaled["novelty"]["gp_ucb"]
+            + 0.15 * scaled["pof"]["gp_ucb"]
+        ),
+        "gp_ei": (
+            0.65 * scaled["ei"]["gp_ei"]
+            + 0.20 * scaled["pof"]["gp_ei"]
+            + 0.15 * (1.0 - scaled["std"]["gp_ei"])
+        ),
+        "anisotropic_turbo": (
+            0.55 * scaled["ei"]["anisotropic_turbo"]
+            + 0.20 * scaled["pof"]["anisotropic_turbo"]
+            + 0.15 * scaled["information"]["anisotropic_turbo"]
+            + 0.10 * scaled["novelty"]["anisotropic_turbo"]
+        ),
+        "cma_local": (
+            0.45 * scaled["ei"]["cma_local"]
+            + 0.30 * scaled["pof"]["cma_local"]
+            + 0.15 * scaled["confirmation"]["cma_local"]
+            + 0.10 * (1.0 - scaled["std"]["cma_local"])
+        ),
+    }
+    for strategy in PORTFOLIO_STRATEGIES:
+        if strategy not in best:
+            scores[strategy] = 0.0
+    return {key: float(value) for key, value in scores.items()}, best, components
+
+
+def _normalise_feature_for(
+    values: Mapping[str, float], strategies: Sequence[str]
+) -> dict[str, float]:
+    finite = [float(values.get(strategy, 0.0)) for strategy in strategies]
+    lower, upper = min(finite), max(finite)
+    if upper - lower <= 1e-12:
+        return {strategy: 0.5 for strategy in strategies}
+    return {
+        strategy: float((float(values.get(strategy, lower)) - lower) / (upper - lower))
+        for strategy in strategies
+    }
 def _score_confidence(
     *,
     scores: Sequence[float],

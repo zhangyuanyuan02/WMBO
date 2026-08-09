@@ -11,9 +11,18 @@ import numpy as np
 from scipy.stats import qmc
 
 from .acquisition import AcquisitionInput, expected_improvement, score_candidates, select_next_candidate
-from .agents import AgentState, CandidateValidator, WorldModelAgent
+from .agents import AgentState, CandidateValidator, ReasoningDecision, WorldModelAgent
+from .portfolio import (
+    MACRO_DURATIONS,
+    MacroActionState,
+    OnePlusOneCMAState,
+    PORTFOLIO_STRATEGIES,
+    TurboState,
+    objective_scale,
+    portfolio_shape,
+)
 from .benchmarks import BenchmarkSpec, EvaluationResult, sample_unit_points
-from .control import STRATEGIES, OptimizerConfig, WMBOControlConfig, WMBOState
+from .control import STRATEGIES, OptimizerConfig, PortfolioWMBOState, WMBOControlConfig, WMBOState
 from .descriptors import LandscapeDescriptor, describe_landscape
 from .surrogate import SurrogateDataset, make_surrogate
 from .llm_api import LLMAPIError, OpenAIStyleClient, decide_with_llm
@@ -528,12 +537,39 @@ class WMBOOptimizer:
         if not isinstance(raw_rule_policy, Mapping):
             raise ValueError("optimizer.options.rule_policy must be a mapping.")
         self._agent = WorldModelAgent(raw_rule_policy)
-        self._control = WMBOState(_wmbo_control_config_from_options(self.config.options))
+        control_config = _wmbo_control_config_from_options(self.config.options)
+        self._portfolio_v5 = self._agent.config.mode == "portfolio_v5"
+        self._control = (
+            PortfolioWMBOState(control_config)
+            if self._portfolio_v5
+            else WMBOState(control_config)
+        )
         self._llm_client: OpenAIStyleClient | None = None
         self._last_decision: Mapping[str, object] | None = None
         self._last_acquisition: Mapping[str, object] | None = None
         self._pending_trial: Mapping[str, object] | None = None
+        self._macro_action: MacroActionState | None = None
+        self._macro_counter = 0
+        self._turbo_state: TurboState | None = None
+        self._cma_state: OnePlusOneCMAState | None = None
 
+    def _finish_macro(self, reason: str, trial_number: int) -> dict[str, object] | None:
+        if self._macro_action is None:
+            return None
+        macro = self._macro_action
+        macro.termination_reason = str(reason)
+        reward, components = macro.reward()
+        self._control.record_delayed_reward(
+            macro.strategy, reward=reward, trial_number=trial_number
+        )
+        summary = {
+            **macro.to_dict(),
+            "macro_continued": False,
+            "macro_reward": reward,
+            "macro_reward_components": components,
+        }
+        self._macro_action = None
+        return summary
     def ask(self, state: OptimizerState) -> Vector:
         """Propose a candidate using rule-based world-model reasoning.
 
@@ -633,67 +669,157 @@ class WMBOOptimizer:
             self.config.options.get("disable_hypothesis_tracking", False)
         )
         active_hypotheses = self._control.hypothesis_summary() if hypothesis_tracking else []
-        candidate_options = _build_strategy_candidate_options(
-            surrogate=surrogate,
-            observed_x=observed_x,
-            observed_y=observed_y,
-            dim=state.benchmark.dim,
-            n_pool=max(1, self.config.candidate_pool_size),
-            n_options_per_strategy=max(1, int(self._control.config.candidate_options_per_strategy)),
-            seed=self.config.seed + 25_000 + state.step,
-            phase=phase,
-            active_hypotheses=active_hypotheses,
-            hypothesis_alignment_weight=(
-                float(self._control.config.hypothesis_alignment_weight)
-                if hypothesis_tracking
-                else 0.0
-            ),
-            information_gain_weight=float(self._control.config.information_gain_weight),
-            world_model_entropy=float(descriptor.calibration.get("world_model_entropy", 1.0)),
-            constraint_surrogate=constraint_surrogate,
-            has_feasible_observation=bool(np.any(feasible)),
-            feasibility_floor=float(self.config.options.get("constraint_pof_floor", 0.05)),
-            best_x=best_x,
-            feasible_x=observed_x[feasible] if np.any(feasible) else None,
-        )
+        if self._portfolio_v5:
+            if self._turbo_state is None or self._turbo_state.dim != state.benchmark.dim:
+                self._turbo_state = TurboState(dim=state.benchmark.dim)
+            if self._cma_state is None or self._cma_state.dim != state.benchmark.dim:
+                self._cma_state = OnePlusOneCMAState(
+                    dim=state.benchmark.dim, seed=self.config.seed + 90_000
+                )
+            candidate_options = _build_portfolio_candidate_options(
+                surrogate=surrogate,
+                observed_x=observed_x,
+                observed_y=observed_y,
+                dim=state.benchmark.dim,
+                n_pool=max(1, self.config.candidate_pool_size),
+                n_options_per_strategy=max(
+                    1, int(self._control.config.candidate_options_per_strategy)
+                ),
+                seed=self.config.seed + 25_000 + state.step,
+                active_hypotheses=active_hypotheses,
+                information_gain_weight=float(self._control.config.information_gain_weight),
+                world_model_entropy=float(
+                    descriptor.calibration.get("world_model_entropy", 1.0)
+                ),
+                constraint_surrogate=constraint_surrogate,
+                has_feasible_observation=bool(np.any(feasible)),
+                feasibility_floor=float(
+                    self.config.options.get("constraint_pof_floor", 0.05)
+                ),
+                best_x=best_x,
+                feasible_x=observed_x[feasible] if np.any(feasible) else None,
+                lengthscales=dict(descriptor_prediction.metadata).get("lengthscales"),
+                turbo_state=self._turbo_state,
+                cma_state=self._cma_state,
+            )
+        else:
+            candidate_options = _build_strategy_candidate_options(
+                surrogate=surrogate,
+                observed_x=observed_x,
+                observed_y=observed_y,
+                dim=state.benchmark.dim,
+                n_pool=max(1, self.config.candidate_pool_size),
+                n_options_per_strategy=max(
+                    1, int(self._control.config.candidate_options_per_strategy)
+                ),
+                seed=self.config.seed + 25_000 + state.step,
+                phase=phase,
+                active_hypotheses=active_hypotheses,
+                hypothesis_alignment_weight=(
+                    float(self._control.config.hypothesis_alignment_weight)
+                    if hypothesis_tracking else 0.0
+                ),
+                information_gain_weight=float(self._control.config.information_gain_weight),
+                world_model_entropy=float(
+                    descriptor.calibration.get("world_model_entropy", 1.0)
+                ),
+                constraint_surrogate=constraint_surrogate,
+                has_feasible_observation=bool(np.any(feasible)),
+                feasibility_floor=float(
+                    self.config.options.get("constraint_pof_floor", 0.05)
+                ),
+                best_x=best_x,
+                feasible_x=observed_x[feasible] if np.any(feasible) else None,
+            )
         labels = dict(descriptor.labels)
-        strategy_context = self._control.decision_context(
-            phase=phase,
-            trial_number=state.step + 1,
-            completed_trials=state.step,
-            budget=self.config.budget,
-            uncertainty=float(
+        context_kwargs: dict[str, object] = {
+            "phase": phase,
+            "trial_number": state.step + 1,
+            "completed_trials": state.step,
+            "budget": self.config.budget,
+            "uncertainty": float(
                 descriptor.uncertainty if descriptor.uncertainty is not None else 1.0
             ),
-            smoothness_label=labels.get("smoothness", "unknown"),
-            modality_label=labels.get("modality", "unknown"),
-            flexible_local_follow_up=self._agent.config.mode == "continuous_v4",
-        )
+            "smoothness_label": labels.get("smoothness", "unknown"),
+            "modality_label": labels.get("modality", "unknown"),
+            "flexible_local_follow_up": self._agent.config.mode == "continuous_v4",
+        }
+        if self._portfolio_v5:
+            context_kwargs["has_feasible_observation"] = bool(np.any(feasible))
+            context_kwargs["available_strategies"] = sorted(
+                {
+                    str(option.get("strategy"))
+                    for option in candidate_options
+                    if option.get("candidate_id") is not None
+                }
+            )
+        strategy_context = self._control.decision_context(**context_kwargs)
 
-        decision, agent_type, llm_error = self._decide(
-            state=state,
-            descriptor=descriptor,
-            observed_x=observed_x,
-            observed_y=observed_y,
-            candidate_options=candidate_options,
-            phase=phase,
-            decision_context=strategy_context.to_dict(),
-        )
-        labels = dict(descriptor.labels)
+        settled_macro = None
+        if self._portfolio_v5 and self._macro_action is not None:
+            if self._macro_action.strategy not in strategy_context.allowed_strategies:
+                settled_macro = self._finish_macro(
+                    "strategy_gated", trial_number=state.step + 1
+                )
+            elif self._control.remaining_budget(state.step, self.config.budget) <= 0:
+                settled_macro = self._finish_macro(
+                    "budget_exhausted", trial_number=state.step + 1
+                )
+        macro_continued = self._portfolio_v5 and self._macro_action is not None
+        decision_context = strategy_context.to_dict()
+        if macro_continued:
+            decision_context.update(
+                {
+                    "forced_strategy": self._macro_action.strategy,
+                    "forced_reason": "macro_action_continuation",
+                }
+            )
+            decision = ReasoningDecision(
+                strategy=self._macro_action.strategy,
+                hypothesis="Continuing the active macro action with an updated surrogate.",
+                confidence=0.95,
+                rationale="The operator remains legal and its macro duration is not complete.",
+                metadata={
+                    "source": "macro_continuation",
+                    "rule_policy_mode": "portfolio_v5",
+                    "allowed_strategies": list(strategy_context.allowed_strategies),
+                    "forced_strategy": self._macro_action.strategy,
+                },
+            )
+            agent_type, llm_error = "macro_continuation", None
+        else:
+            decision, agent_type, llm_error = self._decide(
+                state=state,
+                descriptor=descriptor,
+                observed_x=observed_x,
+                observed_y=observed_y,
+                candidate_options=candidate_options,
+                phase=phase,
+                decision_context=decision_context,
+            )
         shared_context_enabled = (
-            self._agent.config.mode in {"continuous_v2", "continuous_v3", "continuous_v4"}
+            self._agent.config.mode in {
+                "continuous_v2", "continuous_v3", "continuous_v4", "portfolio_v5"
+            }
             or _truthy(self.config.options.get("use_llm_agent", False))
         )
         execution_context = strategy_context if shared_context_enabled else None
-        executed_strategy, override_reason, allowed_strategies = self._control.choose_strategy(
-            proposed_strategy=decision.strategy,
-            phase=phase,
-            trial_number=state.step + 1,
-            uncertainty=float(descriptor.uncertainty if descriptor.uncertainty is not None else 1.0),
-            smoothness_label=labels.get("smoothness", "unknown"),
-            modality_label=labels.get("modality", "unknown"),
-            decision_context=execution_context,
-        )
+        if macro_continued:
+            executed_strategy = self._macro_action.strategy
+            override_reason = None
+            allowed_strategies = set(strategy_context.allowed_strategies)
+        else:
+            executed_strategy, override_reason, allowed_strategies = self._control.choose_strategy(
+                proposed_strategy=decision.strategy,
+                phase=phase,
+                trial_number=state.step + 1,
+                uncertainty=float(
+                    descriptor.uncertainty if descriptor.uncertainty is not None else 1.0
+                ),
+                smoothness_label=labels.get("smoothness", "unknown"),
+                modality_label=labels.get("modality", "unknown"),
+                decision_context=execution_context,
+            )
 
         selected_option, candidate_override = _select_strategy_candidate(
             candidate_options,
@@ -715,6 +841,31 @@ class WMBOOptimizer:
             candidate = validator.repair(candidate)
             candidate_override = "candidate_repaired" if candidate_override is None else f"{candidate_override};candidate_repaired"
 
+        if self._portfolio_v5 and self._macro_action is None:
+            minimum, maximum = MACRO_DURATIONS[executed_strategy]
+            remaining = max(
+                1, self._control.remaining_budget(state.step, self.config.budget)
+            )
+            if remaining < minimum:
+                minimum = remaining
+                maximum = remaining
+            else:
+                maximum = min(maximum, remaining)
+            self._macro_counter += 1
+            start_best = (
+                _constraint_progress_value(state.observations, constrained=constrained)
+                if state.observations else float(np.min(observed_y))
+            )
+            self._macro_action = MacroActionState(
+                macro_id=f"macro_{self._macro_counter:05d}",
+                strategy=executed_strategy,
+                start_trial=state.step + 1,
+                start_best=float(start_best),
+                start_scale=objective_scale(observed_y),
+                min_steps=minimum,
+                max_steps=maximum,
+            )
+
         structured_hypothesis = _structured_hypothesis(
             decision=decision,
             candidate=candidate,
@@ -724,25 +875,36 @@ class WMBOOptimizer:
             trial_number=state.step + 1,
             hypothesis_window=int(self._control.config.hypothesis_window),
         )
-        hypothesis_record = (
-            self._control.create_hypothesis(
-                text=decision.hypothesis,
-                strategy=executed_strategy,
-                trial_number=state.step + 1,
-                baseline_best=(
-                    _constraint_progress_value(state.observations, constrained=constrained)
-                    if state.observations
-                    else float(np.min(observed_y))
+        if macro_continued and self._macro_action is not None:
+            hypothesis_record = next(
+                (
+                    record for record in self._control.hypotheses
+                    if record.hypothesis_id == self._macro_action.hypothesis_id
                 ),
-                confidence=structured_hypothesis["confidence"],
-                region_center=structured_hypothesis["region_center"],
-                region_radius=structured_hypothesis["region_radius"],
-                sensitive_dims=structured_hypothesis["sensitive_dims"],
-                falsification_rule=structured_hypothesis["falsification_rule"],
+                None,
             )
-            if hypothesis_tracking
-            else None
-        )
+        else:
+            hypothesis_record = (
+                self._control.create_hypothesis(
+                    text=decision.hypothesis,
+                    strategy=executed_strategy,
+                    trial_number=state.step + 1,
+                    baseline_best=(
+                        _constraint_progress_value(state.observations, constrained=constrained)
+                        if state.observations else float(np.min(observed_y))
+                    ),
+                    confidence=structured_hypothesis["confidence"],
+                    region_center=structured_hypothesis["region_center"],
+                    region_radius=structured_hypothesis["region_radius"],
+                    sensitive_dims=structured_hypothesis["sensitive_dims"],
+                    falsification_rule=structured_hypothesis["falsification_rule"],
+                )
+                if hypothesis_tracking else None
+            )
+            if self._macro_action is not None:
+                self._macro_action.hypothesis_id = (
+                    hypothesis_record.hypothesis_id if hypothesis_record else None
+                )
 
         self._pending_trial = {
             "strategy": executed_strategy,
@@ -755,6 +917,14 @@ class WMBOOptimizer:
             "predicted_constraint_log_ratio": selected_option.get("predicted_constraint_log_ratio"),
             "evidence_role": selected_option.get("evidence_role"),
             "target_hypothesis_id": selected_option.get("target_hypothesis_id"),
+            "information_gain": selected_option.get("information_gain", 0.0),
+            "macro_action_id": (
+                self._macro_action.macro_id if self._macro_action is not None else None
+            ),
+            "macro_step": (
+                self._macro_action.completed_steps + 1
+                if self._macro_action is not None else None
+            ),
         }
         self._last_decision = {
             **decision.to_dict(),
@@ -770,9 +940,46 @@ class WMBOOptimizer:
             "strategy_scores": decision.metadata.get("strategy_scores"),
             "score_components": decision.metadata.get("score_components"),
             "masked_strategies": decision.metadata.get("masked_strategies", []),
-            "forced_strategy": execution_context.forced_strategy if execution_context else None,
-            "forced_reason": execution_context.forced_reason if execution_context else None,
+            "forced_strategy": decision_context.get("forced_strategy"),
+            "forced_reason": decision_context.get("forced_reason"),
             "strategy_gate_reasons": list(strategy_context.gate_reasons),
+            "macro_action_id": (
+                self._macro_action.macro_id if self._macro_action is not None else None
+            ),
+            "macro_strategy": (
+                self._macro_action.strategy if self._macro_action is not None else None
+            ),
+            "macro_step": (
+                self._macro_action.completed_steps + 1
+                if self._macro_action is not None else None
+            ),
+            "macro_min_steps": (
+                self._macro_action.min_steps if self._macro_action is not None else None
+            ),
+            "macro_max_steps": (
+                self._macro_action.max_steps if self._macro_action is not None else None
+            ),
+            "macro_continued": bool(macro_continued),
+            "macro_termination_reason": None,
+            "macro_reward": None,
+            "macro_reward_components": None,
+            "previous_macro_settlement": settled_macro,
+            "operator_state_summary": {
+                "anisotropic_turbo": (
+                    self._turbo_state.to_dict() if self._turbo_state is not None else None
+                ),
+                "cma_local": (
+                    self._cma_state.to_dict() if self._cma_state is not None else None
+                ),
+            },
+            "geometry_features": {
+                key: getattr(descriptor, key, None)
+                for key in (
+                    "lengthscale_condition", "local_condition", "rotation_score",
+                    "effective_dimension", "valley_score",
+                )
+            },
+            "regime_posteriors": dict(descriptor.regime_posteriors),
             "selected_candidate_evidence": decision.metadata.get("selected_candidate_evidence"),
             "landscape_descriptor": descriptor.to_dict(),
             "strategy_decision_context": strategy_context.to_dict(),
@@ -942,6 +1149,7 @@ class WMBOOptimizer:
         updated = append_observation(state, result)
         metadata = dict(updated.metadata)
 
+        macro_metadata: dict[str, object] | None = None
         outcome_metadata: dict[str, object] | None = None
         if self._pending_trial is not None and previous_best is not None:
             improved, outcome_y, best_y = _result_improves_constraint_progress(
@@ -964,8 +1172,43 @@ class WMBOOptimizer:
                     if self._pending_trial.get("target_hypothesis_id") is not None
                     else None
                 ),
+                update_trust=not self._portfolio_v5,
             )
             outcome_metadata = outcome.to_dict()
+            if self._portfolio_v5 and self._macro_action is not None:
+                strategy = str(self._pending_trial.get("strategy", ""))
+                candidate_value = self._pending_trial.get("candidate")
+                if strategy == "anisotropic_turbo" and self._turbo_state is not None:
+                    self._turbo_state.update(improved)
+                if (
+                    strategy == "cma_local"
+                    and self._cma_state is not None
+                    and isinstance(candidate_value, Sequence)
+                ):
+                    self._cma_state.update(candidate_value, outcome_y, improved)
+                self._macro_action.record(
+                    best_y=best_y,
+                    improved=improved,
+                    information_gain=float(
+                        self._pending_trial.get("information_gain", 0.0) or 0.0
+                    ),
+                )
+                termination = self._macro_action.should_stop()
+                if updated.step >= self.config.budget:
+                    termination = "budget_exhausted"
+                if termination is not None:
+                    macro_metadata = self._finish_macro(
+                        termination, trial_number=updated.step
+                    )
+                else:
+                    macro_metadata = {
+                        **self._macro_action.to_dict(),
+                        "macro_continued": True,
+                        "operator_state_summary": {
+                            "anisotropic_turbo": self._turbo_state.to_dict(),
+                            "cma_local": self._cma_state.to_dict(),
+                        },
+                    }
 
         if self._last_decision is not None:
             decision_metadata = dict(self._last_decision)
@@ -986,6 +1229,8 @@ class WMBOOptimizer:
                         decision_metadata["hypothesis_last_evidence"] = record.last_evidence
                     else:
                         decision_metadata["hypothesis_status"] = None
+            if macro_metadata is not None:
+                decision_metadata.update(macro_metadata)
             decision_metadata["strategy_trust"] = dict(self._control.trusts)
             decision_metadata["strategy_success_rates"] = self._control.recent_success_rates()
             decision_metadata["hypothesis_status_counts"] = self._control.hypothesis_status_counts()
@@ -1398,6 +1643,210 @@ def _truthy(value: object) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _build_portfolio_candidate_options(
+    *,
+    surrogate: Any,
+    observed_x: np.ndarray,
+    observed_y: np.ndarray,
+    dim: int,
+    n_pool: int,
+    n_options_per_strategy: int,
+    seed: int,
+    active_hypotheses: Sequence[Mapping[str, object]],
+    information_gain_weight: float,
+    world_model_entropy: float,
+    constraint_surrogate: Any | None,
+    has_feasible_observation: bool,
+    feasibility_floor: float,
+    best_x: np.ndarray,
+    feasible_x: np.ndarray | None,
+    lengthscales: object,
+    turbo_state: TurboState,
+    cma_state: OnePlusOneCMAState,
+) -> list[dict[str, object]]:
+    """Build one pool and make one objective-surrogate prediction per v5 operator."""
+
+    count = max(1, int(n_pool))
+    option_count = max(1, int(n_options_per_strategy))
+    hypotheses = [
+        item for item in active_hypotheses
+        if str(item.get("status", "active")) == "active"
+    ]
+    roles = ("optimize", "confirm", "falsify") if hypotheses else ("optimize",)
+    shape = portfolio_shape(observed_x, observed_y, lengthscales)
+    best_y = float(np.min(observed_y)) if len(observed_y) else 0.0
+    cma_state.ensure(best_x, best_y, shape)
+    options: list[dict[str, object]] = []
+
+    for strategy_index, strategy in enumerate(PORTFOLIO_STRATEGIES):
+        if strategy == "cma_local" and not has_feasible_observation:
+            continue
+        operator_seed = int(seed) + 10_000 * strategy_index
+        sobol = qmc.Sobol(d=dim, scramble=True, seed=operator_seed)
+        sobol_count = count
+        sobol_pool = sobol.random_base2(int(math.ceil(math.log2(max(1, sobol_count)))))[:sobol_count]
+        if strategy in {"global_sobol", "gp_ucb", "gp_ei"}:
+            pool = np.asarray(sobol_pool, dtype=float)
+        elif strategy == "anisotropic_turbo":
+            local_count = max(1, int(math.ceil(0.80 * count)))
+            global_count = max(0, count - local_count)
+            rng = np.random.default_rng(operator_seed + 1)
+            local = rng.multivariate_normal(
+                np.asarray(best_x, dtype=float),
+                (float(turbo_state.radius) ** 2) * shape,
+                size=local_count,
+                check_valid="ignore",
+            )
+            pool = np.vstack([np.clip(local, 0.0, 1.0), sobol_pool[:global_count]])
+        else:
+            sample_count = count * (8 if constraint_surrogate is not None else 1)
+            raw_pool = cma_state.sample(sample_count, operator_seed)
+            if constraint_surrogate is not None:
+                raw_pool = np.vstack([np.asarray(best_x, dtype=float), raw_pool])
+                raw_pof, _raw_constraint_mean, _raw_constraint_std = _predict_feasibility(
+                    constraint_surrogate, raw_pool, feasible_x=feasible_x
+                )
+                eligible = np.flatnonzero(
+                    np.asarray(raw_pof, dtype=float) >= float(feasibility_floor)
+                )
+                if not len(eligible):
+                    continue
+                pool = raw_pool[eligible[:count]]
+            else:
+                pool = raw_pool[:count]
+
+        prediction = surrogate.predict(pool)
+        feasibility_probability = None
+        constraint_mean = None
+        constraint_std = None
+        if constraint_surrogate is not None:
+            feasibility_probability, constraint_mean, constraint_std = _predict_feasibility(
+                constraint_surrogate, pool, feasible_x=feasible_x
+            )
+        acquisition_strategy = {
+            "global_sobol": "global_diverse",
+            "gp_ucb": "explore_ucb",
+            "gp_ei": "exploit_ei",
+            "anisotropic_turbo": "exploit_ei",
+            "cma_local": "exploit_ei",
+        }[strategy]
+        acquisition = AcquisitionInput(
+            candidates=pool.tolist(),
+            observed_x=observed_x.tolist(),
+            observed_y=observed_y.tolist(),
+            surrogate_mean=prediction.mean,
+            surrogate_std=prediction.std,
+            strategy=acquisition_strategy,
+            feasibility_probability=feasibility_probability,
+            constraint_std=constraint_std,
+            has_feasible_observation=has_feasible_observation,
+            feasibility_floor=feasibility_floor,
+        )
+        strategy_scores = np.asarray(score_candidates(acquisition), dtype=float)
+        raw_ei = np.asarray(
+            expected_improvement(
+                prediction.mean, prediction.std, best_y=best_y, xi=0.001
+            ),
+            dtype=float,
+        )
+        constrained_ei = np.asarray(
+            score_candidates(
+                AcquisitionInput(
+                    candidates=pool.tolist(),
+                    observed_x=observed_x.tolist(),
+                    observed_y=observed_y.tolist(),
+                    surrogate_mean=prediction.mean,
+                    surrogate_std=prediction.std,
+                    strategy="exploit_ei",
+                    feasibility_probability=feasibility_probability,
+                    constraint_std=constraint_std,
+                    has_feasible_observation=has_feasible_observation,
+                    feasibility_floor=feasibility_floor,
+                )
+            ),
+            dtype=float,
+        )
+        information, confirmation, falsification, confirm_targets, falsify_targets = (
+            _candidate_information_values(
+                candidates=pool.tolist(),
+                surrogate_std=prediction.std,
+                observed_x=observed_x,
+                hypotheses=hypotheses,
+                world_model_entropy=world_model_entropy,
+            )
+        )
+        optimisation = (
+            0.65 * _scale_candidates_01(strategy_scores)
+            + 0.35 * _scale_candidates_01(constrained_ei)
+        )
+        used_indices: set[int] = set()
+        for option_index in range(option_count):
+            role = roles[option_index % len(roles)]
+            if role == "confirm":
+                role_values = confirmation
+                targets = confirm_targets
+            elif role == "falsify":
+                role_values = falsification
+                targets = falsify_targets
+            else:
+                role_values = information
+                targets = [None] * len(pool)
+            joint = (
+                (1.0 - information_gain_weight) * optimisation
+                + information_gain_weight * _scale_candidates_01(role_values)
+            )
+            order = np.argsort(-np.asarray(joint, dtype=float), kind="stable")
+            selected_index = next(
+                (int(index) for index in order if int(index) not in used_indices),
+                int(order[0]),
+            )
+            used_indices.add(selected_index)
+            x = [float(value) for value in pool[selected_index]]
+            pof = (
+                float(feasibility_probability[selected_index])
+                if feasibility_probability is not None
+                else 1.0
+            )
+            target = targets[selected_index] if selected_index < len(targets) else None
+            options.append(
+                {
+                    "candidate_id": f"{strategy}_{option_index + 1}",
+                    "strategy": strategy,
+                    "x_unit": x,
+                    "acquisition_strategy": acquisition_strategy,
+                    "acquisition_score": float(strategy_scores[selected_index]),
+                    "expected_improvement": float(raw_ei[selected_index]),
+                    "constrained_expected_improvement": float(constrained_ei[selected_index]),
+                    "optimisation_utility": float(optimisation[selected_index]),
+                    "information_gain": float(information[selected_index]),
+                    "confirmation_value": float(confirmation[selected_index]),
+                    "falsification_value": float(falsification[selected_index]),
+                    "joint_score": float(joint[selected_index]),
+                    "selection_score": float(joint[selected_index]),
+                    "evidence_role": role,
+                    "target_hypothesis_id": target,
+                    "hypothesis_alignment": _hypothesis_alignment(x, hypotheses),
+                    "surrogate_mean": float(prediction.mean[selected_index]),
+                    "surrogate_std": float(prediction.std[selected_index]),
+                    "probability_feasible": pof,
+                    "predicted_feasibility_probability": pof,
+                    "predicted_constraint_log_ratio": (
+                        float(constraint_mean[selected_index])
+                        if constraint_mean is not None else None
+                    ),
+                    "constraint_std": (
+                        float(constraint_std[selected_index])
+                        if constraint_std is not None else None
+                    ),
+                    "distance_to_best": float(
+                        np.linalg.norm(np.asarray(x, dtype=float) - np.asarray(best_x, dtype=float))
+                    ),
+                    "distance_to_nearest_observation": _distance_to_nearest_observation(
+                        x, observed_x
+                    ),
+                }
+            )
+    return options
 def _build_strategy_candidate_options(
     *,
     surrogate: Any,

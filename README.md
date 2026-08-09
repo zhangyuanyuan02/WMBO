@@ -70,6 +70,22 @@ Command-line values can override config values:
 python run_benchmark.py --config configs/debug.yaml --budget 5 --output-dir results/quick_check
 ```
 
+Run the deterministic Portfolio v5 smoke suite (five heterogeneous operators,
+geometry posteriors, macro-actions, and delayed rewards):
+
+```bash
+python run_benchmark.py --config configs/synthetic_bbob_portfolio_v5_smoke.yaml
+```
+
+Run the paired legacy/v5 ablation suite:
+
+```bash
+python run_benchmark.py --config configs/synthetic_bbob_portfolio_v5_ablation.yaml
+```
+
+Both v5 configs default to eight workers. The paper configuration remains on
+`continuous_v4` until the paired regression gates pass.
+
 Generate figures from saved results:
 
 ```bash

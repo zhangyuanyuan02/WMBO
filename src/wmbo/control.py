@@ -7,6 +7,10 @@ from dataclasses import dataclass, field
 import math
 from typing import Any, Mapping, Sequence
 
+from .portfolio import (
+    PORTFOLIO_EXPLORATION_STRATEGIES,
+    PORTFOLIO_STRATEGIES,
+)
 
 STRATEGIES = ("global_diverse", "explore_ucb", "exploit_ei", "trust_region")
 EXPLORATION_STRATEGIES = {"global_diverse", "explore_ucb"}
@@ -420,11 +424,11 @@ class WMBOState:
             trial_number=int(trial_number),
             remaining_budget=self.remaining_budget(completed_trials, total_budget),
             remaining_ratio=max(0.0, (total_budget - int(completed_trials)) / total_budget),
-            allowed_strategies=tuple(strategy for strategy in STRATEGIES if strategy in allowed),
+            allowed_strategies=tuple(strategy for strategy in self.trusts if strategy in allowed),
             forced_strategy=forced_strategy,
             forced_reason=forced_reason,
             gate_reasons=tuple(gate_reasons),
-            cooldown_until={strategy: int(self.cooldown_until[strategy]) for strategy in STRATEGIES},
+            cooldown_until={strategy: int(self.cooldown_until[strategy]) for strategy in self.trusts},
             consecutive_no_improvement=int(self.consecutive_no_improvement),
             steps_since_exploration=int(self._steps_since_exploration()),
             strategy_trust=dict(self.trusts),
@@ -544,23 +548,30 @@ class WMBOState:
         predicted_std: float | None = None,
         evidence_role: str | None = None,
         target_hypothesis_id: str | None = None,
+        update_trust: bool = True,
     ) -> StrategyRecord:
         """Update trust and only apply evidence relevant to each hypothesis."""
 
         key = str(strategy).strip().lower().replace("-", "_")
-        if key not in STRATEGIES:
-            key = "exploit_ei"
+        if key not in self.trusts:
+            key = "exploit_ei" if "exploit_ei" in self.trusts else next(iter(self.trusts))
         reward = 1.0 if bool(improved) else 0.0
-        alpha = float(self.config.trust_alpha)
-        self.trusts[key] = (1.0 - alpha) * self.trusts[key] + alpha * reward
-        self.outcomes[key].append(bool(improved))
+        if update_trust:
+            alpha = float(self.config.trust_alpha)
+            self.trusts[key] = (1.0 - alpha) * self.trusts[key] + alpha * reward
+            self.outcomes[key].append(bool(improved))
         self.executed_strategies.append(key)
         self.follow_up_local = bool(improved)
         self.consecutive_no_improvement = 0 if improved else self.consecutive_no_improvement + 1
 
         cooldown: int | None = None
         recent = self.outcomes[key]
-        if key in EXPLORATION_STRATEGIES and len(recent) == recent.maxlen and not any(recent):
+        if (
+            update_trust
+            and key in self._exploration_strategy_names()
+            and len(recent) == recent.maxlen
+            and not any(recent)
+        ):
             cooldown = int(trial_number) + int(self.config.failure_cooldown_trials) + 1
             self.cooldown_until[key] = cooldown
 
@@ -588,6 +599,29 @@ class WMBOState:
         )
         self.strategy_history.append(outcome)
         return outcome
+
+    def record_delayed_reward(
+        self, strategy: str, reward: float, trial_number: int
+    ) -> int | None:
+        """Update strategy trust once after a completed macro action."""
+
+        key = str(strategy).strip().lower().replace("-", "_")
+        if key not in self.trusts:
+            raise ValueError(f"Unknown strategy for delayed reward: {key}")
+        bounded = float(min(max(float(reward), 0.0), 1.0))
+        alpha = float(self.config.trust_alpha)
+        self.trusts[key] = (1.0 - alpha) * self.trusts[key] + alpha * bounded
+        self.outcomes[key].append(bounded)
+        recent = self.outcomes[key]
+        if (
+            key in self._exploration_strategy_names()
+            and len(recent) == recent.maxlen
+            and not any(value > 0.0 for value in recent)
+        ):
+            cooldown = int(trial_number) + int(self.config.failure_cooldown_trials) + 1
+            self.cooldown_until[key] = cooldown
+            return cooldown
+        return None
 
     def _update_hypotheses(
         self,
@@ -680,6 +714,9 @@ class WMBOState:
             updates.append(update)
         return updates
 
+    def _exploration_strategy_names(self) -> set[str]:
+        return set(EXPLORATION_STRATEGIES)
+
     def to_dict(self) -> dict[str, Any]:
         """Return the controller state in a JSON-friendly form."""
 
@@ -706,7 +743,7 @@ class WMBOState:
         if not self.executed_strategies:
             return max(1, int(self.config.multimodal_explore_interval))
         for offset, strategy in enumerate(reversed(self.executed_strategies), start=1):
-            if strategy in EXPLORATION_STRATEGIES:
+            if strategy in self._exploration_strategy_names():
                 return offset - 1
         return len(self.executed_strategies)
 
@@ -831,6 +868,131 @@ def _normalise_sensitive_dims(value: Sequence[int] | None) -> list[int]:
             result.append(parsed)
     return result
 
+@dataclass
+class PortfolioWMBOState(WMBOState):
+    """Controller profile for the five portfolio-v5 operators."""
+
+    has_feasible_observation: bool = True
+
+    def __post_init__(self) -> None:
+        self.trusts = {
+            strategy: float(self.config.trust_initial) for strategy in PORTFOLIO_STRATEGIES
+        }
+        self.outcomes = {
+            strategy: deque(maxlen=max(1, int(self.config.trust_window)))
+            for strategy in PORTFOLIO_STRATEGIES
+        }
+        self.cooldown_until = defaultdict(int)
+
+    def decision_context(
+        self,
+        *,
+        has_feasible_observation: bool = True,
+        available_strategies: Sequence[str] | None = None,
+        **kwargs: Any,
+    ) -> StrategyDecisionContext:
+        self.has_feasible_observation = bool(has_feasible_observation)
+        context = super().decision_context(**kwargs)
+        if available_strategies is None:
+            return context
+        available = {
+            str(strategy) for strategy in available_strategies
+            if str(strategy) in PORTFOLIO_STRATEGIES
+        }
+        allowed = tuple(
+            strategy for strategy in context.allowed_strategies if strategy in available
+        )
+        reasons = tuple(context.gate_reasons) + tuple(
+            f"{strategy}_candidate_unavailable"
+            for strategy in PORTFOLIO_STRATEGIES
+            if strategy not in available
+        )
+        if not allowed:
+            raise ValueError("No portfolio strategy produced a valid candidate.")
+        forced = context.forced_strategy if context.forced_strategy in allowed else None
+        return StrategyDecisionContext(
+            phase=context.phase,
+            trial_number=context.trial_number,
+            remaining_budget=context.remaining_budget,
+            remaining_ratio=context.remaining_ratio,
+            allowed_strategies=allowed,
+            forced_strategy=forced,
+            forced_reason=context.forced_reason if forced else None,
+            gate_reasons=reasons,
+            cooldown_until=context.cooldown_until,
+            consecutive_no_improvement=context.consecutive_no_improvement,
+            steps_since_exploration=context.steps_since_exploration,
+            strategy_trust=context.strategy_trust,
+            strategy_success_rates=context.strategy_success_rates,
+        )
+
+    def allowed_strategies(
+        self,
+        phase: str,
+        trial_number: int,
+        uncertainty: float,
+        modality_label: str = "unknown",
+    ) -> tuple[set[str], list[str]]:
+        allowed = set(PORTFOLIO_STRATEGIES)
+        reasons: list[str] = []
+        trial = int(trial_number)
+        for strategy in PORTFOLIO_EXPLORATION_STRATEGIES:
+            if trial < int(self.cooldown_until[strategy]):
+                allowed.discard(strategy)
+                reasons.append(f"{strategy}_cooldown")
+        global_run = self._consecutive_strategy_count("global_sobol")
+        if phase == "early" and global_run >= self.config.global_max_consecutive_early:
+            allowed.discard("global_sobol")
+            reasons.append("early_global_consecutive_limit")
+        elif phase == "middle":
+            if global_run >= self.config.global_max_consecutive_middle:
+                allowed.discard("global_sobol")
+                reasons.append("middle_global_consecutive_limit")
+            if float(uncertainty) < self.config.middle_global_uncertainty_threshold:
+                allowed.discard("global_sobol")
+                reasons.append("middle_global_uncertainty_too_low")
+        elif phase == "late":
+            allowed.discard("global_sobol")
+            reasons.append("late_global_forbidden")
+            allow_ucb = (
+                float(uncertainty) >= self.config.late_explore_uncertainty_threshold
+                and self.consecutive_no_improvement >= 2
+            )
+            if not allow_ucb:
+                allowed.discard("gp_ucb")
+                reasons.append("late_exploration_gate")
+        if not self.has_feasible_observation:
+            allowed.discard("cma_local")
+            reasons.append("cma_local_requires_feasible_observation")
+        if not allowed:
+            allowed.update({"gp_ei", "anisotropic_turbo"})
+            reasons.append("fallback_local_strategies_enabled")
+        return allowed, reasons
+
+    def _exploration_strategy_names(self) -> set[str]:
+        return set(PORTFOLIO_EXPLORATION_STRATEGIES)
+
+    def _multimodal_exploration_guard(
+        self,
+        *,
+        allowed: set[str],
+        phase: str,
+        uncertainty: float,
+        modality_label: str,
+    ) -> str | None:
+        if modality_label not in {"multimodal", "highly_multimodal"}:
+            return None
+        exploratory = [item for item in ("gp_ucb", "global_sobol") if item in allowed]
+        if not exploratory or self._steps_since_exploration() < max(1, int(self.config.multimodal_explore_interval)):
+            return None
+        threshold = (
+            self.config.multimodal_late_explore_uncertainty_threshold
+            if phase == "late"
+            else self.config.multimodal_explore_uncertainty_threshold
+        )
+        return exploratory[0] if float(uncertainty) >= float(threshold) else None
+
+
 
 def _normalise_text(value: object) -> str | None:
     if value is None:
@@ -908,4 +1070,5 @@ __all__ = [
     "build_default_optimizer_config",
     "should_stop",
     "update_run_state",
+    "PortfolioWMBOState",
 ]

@@ -1,0 +1,41 @@
+experiment:
+  methods: [wmbo_rule]
+  seeds: [0]
+  budget: 40
+  initial_samples: 10
+  shared_initial_design: sobol
+  candidate_pool_size: 256
+  output_dir: results/synthetic_bbob_portfolio_v5_smoke
+
+benchmark_suite:
+  bbob:
+    functions: [1, 5, 7, 8, 10, 12, 14, 15, 16, 19, 20, 22, 24]
+    dimensions: [5]
+    instances: [1]
+
+optimizer:
+  options:
+    surrogate: gaussian_process
+    noise_level: 1.0e-6
+    rule_policy:
+      mode: portfolio_v5
+      landscape_weight: 0.25
+      geometry_weight: 0.30
+      candidate_weight: 0.30
+      history_weight: 0.15
+      temperature: 0.20
+  wmbo_control:
+    candidate_options_per_strategy: 3
+    hypothesis_alignment_weight: 0.15
+    information_gain_weight: 0.35
+    gp_verifier_enabled: true
+    gp_verifier_min_score_ratio: 0.75
+    gp_verifier_duplicate_distance: 0.0001
+
+execution:
+  continue_on_error: true
+  resume: true
+  workers: 8
+
+logging:
+  verbose: true

@@ -8,6 +8,8 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
+
+from .portfolio import geometry_features, regime_posteriors
 Vector = Sequence[float]
 Matrix = Sequence[Vector]
 
@@ -58,6 +60,12 @@ class LandscapeDescriptor:
     dimension_sensitivity: Sequence[float] = field(default_factory=tuple)
     sensitive_dims: Sequence[int] = field(default_factory=tuple)
     property_posteriors: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
+    lengthscale_condition: float | None = None
+    local_condition: float | None = None
+    rotation_score: float | None = None
+    effective_dimension: float | None = None
+    valley_score: float | None = None
+    regime_posteriors: Mapping[str, float] = field(default_factory=dict)
     credible_intervals: Mapping[str, Sequence[float]] = field(default_factory=dict)
     calibration: Mapping[str, float] = field(default_factory=dict)
 
@@ -86,6 +94,15 @@ class LandscapeDescriptor:
             "stagnation": self.stagnation,
             "improvement_rate": self.improvement_rate,
             "dimension_sensitivity": [float(value) for value in self.dimension_sensitivity],
+            "lengthscale_condition": self.lengthscale_condition,
+            "local_condition": self.local_condition,
+            "rotation_score": self.rotation_score,
+            "effective_dimension": self.effective_dimension,
+            "valley_score": self.valley_score,
+            "regime_posteriors": {
+                str(name): float(probability)
+                for name, probability in self.regime_posteriors.items()
+            },
             "sensitive_dims": [int(value) for value in self.sensitive_dims],
             "property_posteriors": {
                 str(name): {str(label): float(probability) for label, probability in probabilities.items()}
@@ -147,6 +164,15 @@ def describe_landscape(
     coverage = estimate_coverage(x.tolist(), y.tolist())
     boundary_bias = estimate_boundary_bias(x.tolist())
     stagnation, improvement_rate = estimate_progress(y.tolist())
+    geometry = geometry_features(
+        x.tolist(),
+        y.tolist(),
+        surrogate_metadata.get("lengthscales")
+        if isinstance(surrogate_metadata, Mapping)
+        else None,
+        curvature=curvature,
+        modality=modality,
+    )
     descriptor = LandscapeDescriptor(
         dim=dim,
         num_observations=int(len(y)),
@@ -154,6 +180,7 @@ def describe_landscape(
         y_range=float(np.max(y) - np.min(y)),
         smoothness=smoothness,
         modality=modality,
+        **geometry,
         curvature=curvature,
         anisotropy=anisotropy,
         uncertainty=uncertainty,
@@ -239,12 +266,27 @@ def estimate_property_posteriors(
 
 def _with_probabilistic_world_model(descriptor: LandscapeDescriptor) -> LandscapeDescriptor:
     posteriors, intervals, calibration = estimate_property_posteriors(descriptor)
+    regimes = regime_posteriors(
+        num_observations=descriptor.num_observations,
+        dim=descriptor.dim,
+        smoothness=descriptor.smoothness,
+        modality=descriptor.modality,
+        curvature=descriptor.curvature,
+        uncertainty=descriptor.uncertainty,
+        geometry={
+            "lengthscale_condition": descriptor.lengthscale_condition,
+            "local_condition": descriptor.local_condition,
+            "rotation_score": descriptor.rotation_score,
+            "effective_dimension": descriptor.effective_dimension,
+        },
+    )
     enriched = LandscapeDescriptor(
         **{
             **descriptor.__dict__,
             "property_posteriors": posteriors,
             "credible_intervals": intervals,
             "calibration": calibration,
+            "regime_posteriors": regimes,
         }
     )
     return LandscapeDescriptor(**{**enriched.__dict__, "labels": label_descriptor(enriched)})

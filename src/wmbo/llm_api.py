@@ -414,10 +414,22 @@ def build_world_model_messages(
 ) -> list[dict[str, str]]:
     """Build messages asking an LLM for a structured WMBO decision."""
 
+    legacy_strategies = (
+        "global_diverse", "explore_ucb", "exploit_ei", "trust_region"
+    )
+    raw_allowed = dict(decision_context or {}).get("allowed_strategies")
+    allowed_strategies = (
+        tuple(str(item).strip().lower().replace("-", "_") for item in raw_allowed)
+        if isinstance(raw_allowed, Sequence)
+        and not isinstance(raw_allowed, (str, bytes, bytearray))
+        and len(raw_allowed) > 0
+        else legacy_strategies
+    )
+    strategy_list = ", ".join(allowed_strategies)
     system = (
         "You are a world-model black-box optimisation agent. "
         "The objective is minimisation under a small evaluation budget. "
-        "Choose exactly one strategy from: global_diverse, explore_ucb, exploit_ei, trust_region. "
+        f"Choose exactly one strategy from: {strategy_list}. "
         "Return strict JSON only with keys: world_model, strategy, hypothesis, hypothesis_region, confidence, falsification_rule, rationale, selected_candidate_id. "
         "world_model must contain categorical fields: smoothness, modality, curvature, anisotropy. "
         "hypothesis_region must be an object with center, radius, and sensitive_dims. "
@@ -451,12 +463,20 @@ def build_world_model_messages(
     ]
 
 
-def parse_reasoning_decision(text: str) -> ReasoningDecision:
+def parse_reasoning_decision(
+    text: str, allowed_strategies: Sequence[str] | None = None
+) -> ReasoningDecision:
     """Parse assistant JSON into a ``ReasoningDecision``."""
 
     data = _extract_json_object(text)
     strategy = str(data.get("strategy", "")).strip().lower().replace("-", "_")
-    allowed = {"global_diverse", "explore_ucb", "exploit_ei", "trust_region"}
+    allowed = {
+        str(item).strip().lower().replace("-", "_")
+        for item in (
+            allowed_strategies
+            or ("global_diverse", "explore_ucb", "exploit_ei", "trust_region")
+        )
+    }
     if strategy not in allowed:
         raise LLMAPIError(f"Unsupported strategy from LLM: {strategy!r}.")
     confidence = _parse_confidence(data.get("confidence", 0.0))
@@ -670,7 +690,14 @@ def decide_with_llm(
         print(f"[LLM thinking] present={has_reasoning}, reasoning_tokens={token_text}")
         print("[LLM output]")
         print(text)
-    decision = parse_reasoning_decision(text)
+    raw_allowed = dict(decision_context or {}).get("allowed_strategies")
+    allowed = (
+        raw_allowed
+        if isinstance(raw_allowed, Sequence)
+        and not isinstance(raw_allowed, (str, bytes, bytearray))
+        else None
+    )
+    decision = parse_reasoning_decision(text, allowed_strategies=allowed)
     usage = response.get("usage", {})
     usage = usage if isinstance(usage, Mapping) else {}
     transport = response.get("_wmbo_transport", {})
