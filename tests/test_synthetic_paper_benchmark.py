@@ -57,6 +57,7 @@ def test_paper_config_dry_run_counts() -> None:
     pytest.importorskip("ioh")
     config = load_run_config("configs/synthetic_bbob_paper.yaml")
     estimate = describe_benchmark_suite(config)
+    assert config.optimizer.options["rule_policy"]["mode"] == "continuous_v4"
     assert estimate == {
         "benchmarks": 240,
         "methods": 10,

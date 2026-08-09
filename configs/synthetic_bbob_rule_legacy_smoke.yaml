@@ -1,0 +1,35 @@
+experiment:
+  methods: [wmbo_rule]
+  seeds: [0]
+  budget: 40
+  initial_samples: 10
+  shared_initial_design: sobol
+  candidate_pool_size: 128
+  output_dir: results/synthetic_bbob_rule_legacy_smoke
+
+benchmark_suite:
+  bbob:
+    functions: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
+    dimensions: [5]
+    instances: [1]
+
+optimizer:
+  options:
+    surrogate: gaussian_process
+    noise_level: 1.0e-6
+    rule_policy:
+      mode: legacy_v1
+  wmbo_control:
+    candidate_options_per_strategy: 5
+    hypothesis_alignment_weight: 0.15
+    information_gain_weight: 0.35
+    gp_verifier_enabled: true
+    gp_verifier_min_score_ratio: 0.75
+    gp_verifier_duplicate_distance: 0.0001
+
+execution:
+  continue_on_error: true
+  resume: true
+  workers: 8
+
+logging:

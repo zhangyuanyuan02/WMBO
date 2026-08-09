@@ -524,7 +524,10 @@ class WMBOOptimizer:
 
         self.config = config
         self._initial = RandomSearchOptimizer(config)
-        self._agent = WorldModelAgent()
+        raw_rule_policy = self.config.options.get("rule_policy", {})
+        if not isinstance(raw_rule_policy, Mapping):
+            raise ValueError("optimizer.options.rule_policy must be a mapping.")
+        self._agent = WorldModelAgent(raw_rule_policy)
         self._control = WMBOState(_wmbo_control_config_from_options(self.config.options))
         self._llm_client: OpenAIStyleClient | None = None
         self._last_decision: Mapping[str, object] | None = None
@@ -653,6 +656,20 @@ class WMBOOptimizer:
             best_x=best_x,
             feasible_x=observed_x[feasible] if np.any(feasible) else None,
         )
+        labels = dict(descriptor.labels)
+        strategy_context = self._control.decision_context(
+            phase=phase,
+            trial_number=state.step + 1,
+            completed_trials=state.step,
+            budget=self.config.budget,
+            uncertainty=float(
+                descriptor.uncertainty if descriptor.uncertainty is not None else 1.0
+            ),
+            smoothness_label=labels.get("smoothness", "unknown"),
+            modality_label=labels.get("modality", "unknown"),
+            flexible_local_follow_up=self._agent.config.mode == "continuous_v4",
+        )
+
         decision, agent_type, llm_error = self._decide(
             state=state,
             descriptor=descriptor,
@@ -660,8 +677,14 @@ class WMBOOptimizer:
             observed_y=observed_y,
             candidate_options=candidate_options,
             phase=phase,
+            decision_context=strategy_context.to_dict(),
         )
         labels = dict(descriptor.labels)
+        shared_context_enabled = (
+            self._agent.config.mode in {"continuous_v2", "continuous_v3", "continuous_v4"}
+            or _truthy(self.config.options.get("use_llm_agent", False))
+        )
+        execution_context = strategy_context if shared_context_enabled else None
         executed_strategy, override_reason, allowed_strategies = self._control.choose_strategy(
             proposed_strategy=decision.strategy,
             phase=phase,
@@ -669,6 +692,7 @@ class WMBOOptimizer:
             uncertainty=float(descriptor.uncertainty if descriptor.uncertainty is not None else 1.0),
             smoothness_label=labels.get("smoothness", "unknown"),
             modality_label=labels.get("modality", "unknown"),
+            decision_context=execution_context,
         )
 
         selected_option, candidate_override = _select_strategy_candidate(
@@ -743,6 +767,15 @@ class WMBOOptimizer:
             "executed_strategy": executed_strategy,
             "override_reason": override_reason,
             "allowed_strategies": sorted(allowed_strategies),
+            "strategy_scores": decision.metadata.get("strategy_scores"),
+            "score_components": decision.metadata.get("score_components"),
+            "masked_strategies": decision.metadata.get("masked_strategies", []),
+            "forced_strategy": execution_context.forced_strategy if execution_context else None,
+            "forced_reason": execution_context.forced_reason if execution_context else None,
+            "strategy_gate_reasons": list(strategy_context.gate_reasons),
+            "selected_candidate_evidence": decision.metadata.get("selected_candidate_evidence"),
+            "landscape_descriptor": descriptor.to_dict(),
+            "strategy_decision_context": strategy_context.to_dict(),
             "budget_phase": phase,
             "remaining_budget": self._control.remaining_budget(state.step, self.config.budget),
             "strategy_trust": dict(self._control.trusts),
@@ -807,6 +840,7 @@ class WMBOOptimizer:
         observed_y: np.ndarray,
         candidate_options: Sequence[Mapping[str, object]],
         phase: str,
+        decision_context: Mapping[str, object],
     ) -> tuple[Any, str, str | None]:
         """Return a rule or LLM decision plus source metadata."""
 
@@ -816,12 +850,15 @@ class WMBOOptimizer:
             descriptor=descriptor.to_dict(),
             budget_used=state.step,
             budget_total=self.config.budget,
+            candidate_options=candidate_options,
+            decision_context=decision_context,
         )
         use_llm = _truthy(self.config.options.get("use_llm_agent", False))
         if not use_llm:
             return self._agent.decide(rule_state), "rule", None
 
-        decision_context = {
+        llm_decision_context = {
+            **dict(decision_context),
             "budget_phase": phase,
             "remaining_budget": self._control.remaining_budget(state.step, self.config.budget),
             "consecutive_no_improvement": self._control.consecutive_no_improvement,
@@ -859,7 +896,7 @@ class WMBOOptimizer:
                 descriptor,
                 client=self._llm_client,
                 candidates=candidate_options,
-                decision_context=decision_context,
+                decision_context=llm_decision_context,
                 model=_optional_str(self.config.options.get("llm_model") or self.config.options.get("api_model")),
                 temperature=float(self.config.options.get("llm_temperature", 0.0)),
                 log_io=_truthy(self.config.options.get("llm_log_io", False)),

@@ -137,6 +137,28 @@ optimizer:
 
 The control state is still applied after an LLM decision, so the LLM proposes a strategy but does not directly control the optimiser.
 
+The rule proposer supports a backwards-compatible legacy mode and an experimental
+constraint-aware continuous scorer:
+
+```yaml
+optimizer:
+  options:
+    rule_policy:
+      mode: continuous_v4
+      landscape_weight: 0.45
+      candidate_weight: 0.35
+      history_weight: 0.20
+      temperature: 0.20
+```
+
+`legacy_v1` remains the default for reproducibility, while `continuous_v2` is
+retained for ablation. `continuous_v3` adds final-regret-aware phase priors.
+`continuous_v4` strengthens the trust-region prior and turns successful-point
+follow-up into a scored competition between `exploit_ei` and `trust_region`
+instead of forcing one of them. Continuous policies mask controller-forbidden strategies and log
+score components and selected-candidate evidence with every observation.
+
+
 The P0 reasoning path now keeps both human-readable labels and calibrated
 categorical posteriors for smoothness, modality, curvature, and anisotropy.
 Each descriptor also records credible intervals, posterior confidence, and

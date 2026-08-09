@@ -137,6 +137,44 @@ class WMBOControlConfig:
     gp_verifier_min_feasibility_probability: float = 0.10
 
 
+@dataclass(frozen=True)
+class StrategyDecisionContext:
+    """Immutable controller snapshot shared with a strategy proposer."""
+
+    phase: str
+    trial_number: int
+    remaining_budget: int
+    remaining_ratio: float
+    allowed_strategies: tuple[str, ...]
+    forced_strategy: str | None
+    forced_reason: str | None
+    gate_reasons: tuple[str, ...]
+    cooldown_until: Mapping[str, int]
+    consecutive_no_improvement: int
+    steps_since_exploration: int
+    strategy_trust: Mapping[str, float]
+    strategy_success_rates: Mapping[str, float]
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-friendly representation for agents and logs."""
+
+        return {
+            "budget_phase": self.phase,
+            "trial_number": self.trial_number,
+            "remaining_budget": self.remaining_budget,
+            "remaining_ratio": self.remaining_ratio,
+            "allowed_strategies": list(self.allowed_strategies),
+            "forced_strategy": self.forced_strategy,
+            "forced_reason": self.forced_reason,
+            "gate_reasons": list(self.gate_reasons),
+            "cooldown_until": dict(self.cooldown_until),
+            "consecutive_no_improvement": self.consecutive_no_improvement,
+            "steps_since_exploration": self.steps_since_exploration,
+            "strategy_trust": dict(self.strategy_trust),
+            "strategy_success_rates": dict(self.strategy_success_rates),
+        }
+
+
 @dataclass
 class HypothesisRecord:
     """A world-model hypothesis tracked across future trials."""
@@ -338,6 +376,61 @@ class WMBOState:
             reasons.append("fallback_local_strategies_enabled")
         return allowed, reasons
 
+    def decision_context(
+        self,
+        *,
+        phase: str,
+        trial_number: int,
+        completed_trials: int,
+        budget: int,
+        uncertainty: float,
+        smoothness_label: str = "unknown",
+        modality_label: str = "unknown",
+        flexible_local_follow_up: bool = False,
+    ) -> StrategyDecisionContext:
+        """Build the single controller snapshot used by proposers and execution."""
+
+        allowed, gate_reasons = self.allowed_strategies(
+            phase, trial_number, uncertainty, modality_label
+        )
+        forced_strategy = self._multimodal_exploration_guard(
+            allowed=allowed,
+            phase=phase,
+            uncertainty=uncertainty,
+            modality_label=modality_label,
+        )
+        forced_reason = "multimodal_exploration_guard" if forced_strategy is not None else None
+        if forced_strategy is None and self.follow_up_local and flexible_local_follow_up:
+            allowed.intersection_update(LOCAL_STRATEGIES)
+            gate_reasons.append("new_best_local_follow_up_local_only")
+        elif forced_strategy is None and self.follow_up_local:
+            local = (
+                "trust_region"
+                if smoothness_label in {"rugged", "mixed"}
+                or modality_label in {"multimodal", "highly_multimodal"}
+                else "exploit_ei"
+            )
+            if local in allowed:
+                forced_strategy = local
+                forced_reason = "new_best_local_follow_up"
+
+        total_budget = max(1, int(budget))
+        return StrategyDecisionContext(
+            phase=str(phase),
+            trial_number=int(trial_number),
+            remaining_budget=self.remaining_budget(completed_trials, total_budget),
+            remaining_ratio=max(0.0, (total_budget - int(completed_trials)) / total_budget),
+            allowed_strategies=tuple(strategy for strategy in STRATEGIES if strategy in allowed),
+            forced_strategy=forced_strategy,
+            forced_reason=forced_reason,
+            gate_reasons=tuple(gate_reasons),
+            cooldown_until={strategy: int(self.cooldown_until[strategy]) for strategy in STRATEGIES},
+            consecutive_no_improvement=int(self.consecutive_no_improvement),
+            steps_since_exploration=int(self._steps_since_exploration()),
+            strategy_trust=dict(self.trusts),
+            strategy_success_rates=self.recent_success_rates(),
+        )
+
     def choose_strategy(
         self,
         proposed_strategy: str,
@@ -346,6 +439,7 @@ class WMBOState:
         uncertainty: float,
         smoothness_label: str = "unknown",
         modality_label: str = "unknown",
+        decision_context: StrategyDecisionContext | None = None,
     ) -> tuple[str, str | None, set[str]]:
         """Accept or repair an agent-proposed strategy.
 
@@ -353,8 +447,19 @@ class WMBOState:
             Tuple ``(executed_strategy, override_reason, allowed_strategies)``.
         """
 
-        allowed, gate_reasons = self.allowed_strategies(phase, trial_number, uncertainty, modality_label)
+        if decision_context is None:
+            allowed, gate_reasons = self.allowed_strategies(
+                phase, trial_number, uncertainty, modality_label
+            )
+        else:
+            allowed = set(decision_context.allowed_strategies)
+            gate_reasons = list(decision_context.gate_reasons)
         proposed = str(proposed_strategy).strip().lower().replace("-", "_")
+
+        if decision_context is not None and decision_context.forced_strategy is not None:
+            forced = decision_context.forced_strategy
+            reason = None if proposed == forced else decision_context.forced_reason
+            return forced, reason, allowed
 
         guard_strategy = self._multimodal_exploration_guard(
             allowed=allowed,
@@ -367,7 +472,10 @@ class WMBOState:
                 return proposed, None, allowed
             return guard_strategy, "multimodal_exploration_guard", allowed
 
-        if self.follow_up_local:
+        flexible_follow_up = (
+            "new_best_local_follow_up_local_only" in gate_reasons
+        )
+        if self.follow_up_local and not flexible_follow_up:
             strategy = "trust_region" if smoothness_label in {"rugged", "mixed"} or modality_label in {"multimodal", "highly_multimodal"} else "exploit_ei"
             if strategy in allowed:
                 return strategy, "new_best_local_follow_up", allowed
@@ -793,6 +901,7 @@ __all__ = [
     "RunConfig",
     "RunState",
     "WMBOControlConfig",
+    "StrategyDecisionContext",
     "WMBOState",
     "HypothesisRecord",
     "StrategyRecord",
