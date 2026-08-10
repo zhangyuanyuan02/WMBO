@@ -1,0 +1,41 @@
+experiment:
+  methods: [portfolio_v51_rc2]
+  seeds: [0]
+  budget: 16
+  initial_samples: 4
+  shared_initial_design: sobol
+  candidate_pool_size: 128
+  output_dir: results/portfolio_v51_rc2_smoke
+
+benchmark_suite:
+  benchmarks: [branin]
+
+optimizer:
+  options:
+    surrogate: gaussian_process
+    noise_level: 1.0e-6
+    rule_policy:
+      mode: portfolio_v5
+      landscape_weight: 0.25
+      geometry_weight: 0.30
+      candidate_weight: 0.30
+      history_weight: 0.15
+      temperature: 0.20
+  method_options:
+    portfolio_v51_rc2:
+      base_method: wmbo_rule
+  wmbo_control:
+    candidate_options_per_strategy: 3
+    hypothesis_alignment_weight: 0.15
+    information_gain_weight: 0.35
+    gp_verifier_enabled: true
+    gp_verifier_min_score_ratio: 0.75
+    gp_verifier_duplicate_distance: 0.0001
+
+execution:
+  continue_on_error: false
+  resume: false
+  workers: 1
+
+logging:
+  verbose: true

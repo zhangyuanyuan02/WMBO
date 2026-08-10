@@ -12,6 +12,7 @@ from wmbo.llm_api import LLMAPIError, parse_reasoning_decision
 from wmbo.optimizers import _build_portfolio_candidate_options
 from wmbo.portfolio import (
     MACRO_DURATIONS,
+    PORTFOLIO_POLICY_VERSION,
     MacroActionState,
     OnePlusOneCMAState,
     PORTFOLIO_STRATEGIES,
@@ -41,6 +42,7 @@ def _agent_state(
     *,
     allowed: list[str] | None = None,
     posteriors: dict[str, float] | None = None,
+    phase: str = "middle",
 ) -> AgentState:
     options = []
     for index, strategy in enumerate(PORTFOLIO_STRATEGIES):
@@ -77,7 +79,7 @@ def _agent_state(
         budget_total=30,
         candidate_options=options,
         decision_context={
-            "budget_phase": "middle",
+            "budget_phase": phase,
             "allowed_strategies": allowed or list(PORTFOLIO_STRATEGIES),
             "strategy_trust": {name: 0.5 for name in PORTFOLIO_STRATEGIES},
         },
@@ -131,6 +133,99 @@ def test_geometry_safely_handles_missing_lengthscales_and_rank_deficiency() -> N
     assert np.linalg.cond(shape) <= 1.0e4 * 1.01
 
 
+
+def test_v51_geometry_is_reliability_shrunk_with_small_samples() -> None:
+    small_x = np.asarray([[0.1, 0.2, 0.3], [0.9, 0.8, 0.7]])
+    small = geometry_features(
+        small_x,
+        [2.0, 1.0],
+        [0.01, 1.0, 10.0],
+        curvature=0.8,
+        modality=0.2,
+    )
+    rng = np.random.default_rng(12)
+    large_x = rng.random((30, 3))
+    large = geometry_features(
+        large_x,
+        np.sum((large_x - 0.3) ** 2, axis=1),
+        [0.01, 1.0, 10.0],
+        curvature=0.8,
+        modality=0.2,
+    )
+    assert small["geometry_reliability"] == pytest.approx(0.0)
+    assert small["rotation_score"] == pytest.approx(0.0)
+    assert small["local_condition"] == pytest.approx(0.0)
+    assert small["effective_dimension"] == pytest.approx(1.0)
+    assert large["geometry_reliability"] > small["geometry_reliability"]
+    assert large["lengthscale_reliability"] > small["lengthscale_reliability"]
+    assert large["lengthscale_condition"] > small["lengthscale_condition"]
+
+
+def test_v51_rc2_lengthscale_reliability_is_half_at_two_d_samples() -> None:
+    # The BBOB policy starts routing after a 2d initial design. RC2 deliberately
+    # trusts ARD condition at 0.5 here instead of Formal's 1/3.
+    x = np.linspace(0.05, 0.95, 12).reshape(6, 2)[:4]
+    features = geometry_features(
+        x,
+        np.sum((x - 0.3) ** 2, axis=1),
+        [0.01, 1.0],
+        curvature=0.5,
+        modality=0.2,
+    )
+    assert len(x) == 2 * x.shape[1]
+    assert features["lengthscale_reliability"] == pytest.approx(0.5)
+
+
+def test_v51_rc2_successful_local_macro_extends_only_after_progress() -> None:
+    cma = MacroActionState("m-cma", "cma_local", 1, 10.0, 1.0, 2, 4)
+    cma.record(10.0, False, 0.0)
+    assert cma.max_steps == 4
+    assert cma.successful_extensions == 0
+    cma.record(9.5, True, 0.0)
+    cma.extend_after_success(6)
+    assert cma.max_steps == 6
+    assert cma.successful_extensions == 1
+    cma.extend_after_success(6)
+    assert cma.successful_extensions == 1
+
+    turbo = MacroActionState("m-turbo", "anisotropic_turbo", 1, 10.0, 1.0, 2, 4)
+    turbo.record(9.8, True, 0.0)
+    turbo.extend_after_success(5)
+    assert turbo.max_steps == 5
+    assert turbo.successful_extensions == 1
+
+
+def test_v51_regime_separates_epistemic_uncertainty_from_ruggedness() -> None:
+    common = dict(
+        num_observations=24,
+        dim=4,
+        smoothness=0.8,
+        modality=0.8,
+        curvature=0.4,
+        coverage=0.8,
+        world_model_entropy=0.5,
+        geometry={
+            "rotation_score": 0.1,
+            "local_condition": 0.1,
+            "lengthscale_condition": 0.1,
+            "effective_dimension": 0.9,
+        },
+    )
+    low_uncertainty = regime_posteriors(uncertainty=0.1, **common)
+    high_uncertainty = regime_posteriors(uncertainty=0.9, **common)
+    assert high_uncertainty["weakly_identified"] > low_uncertainty["weakly_identified"]
+    assert high_uncertainty["rugged_multimodal"] <= low_uncertainty["rugged_multimodal"]
+
+
+def test_v51_macro_durations_are_short_and_adaptive() -> None:
+    assert PORTFOLIO_POLICY_VERSION == "5.1-rc3"
+    assert MACRO_DURATIONS["global_sobol"] == (1, 1)
+    assert MACRO_DURATIONS["gp_ucb"] == (1, 1)
+    assert MACRO_DURATIONS["gp_ei"] == (1, 1)
+    assert MACRO_DURATIONS["anisotropic_turbo"] == (2, 4)
+    assert MACRO_DURATIONS["cma_local"] == (2, 4)
+
+
 def test_turbo_and_cma_updates_are_deterministic_and_bounded() -> None:
     turbo = TurboState(dim=2)
     for _ in range(3):
@@ -167,6 +262,280 @@ def test_macro_reward_is_positive_affine_scale_invariant_and_once_per_macro() ->
     assert base.should_stop() == "max_steps"
 
 
+def test_v51_macro_reward_is_progress_centred_and_phase_decayed() -> None:
+    failed = MacroActionState("m_fail", "global_sobol", 1, 10.0, 5.0, 1, 1)
+    failed.record(10.0, False, 1.0)
+    early_reward, early_components = failed.reward(phase="early")
+    middle_reward, _ = failed.reward(phase="middle")
+    late_reward, late_components = failed.reward(phase="late")
+    assert early_reward == pytest.approx(0.15)
+    assert middle_reward == pytest.approx(0.05)
+    assert late_reward == pytest.approx(0.0)
+    assert early_components["objective_success"] == 0.0
+    assert late_components["information_weight"] == 0.0
+
+    improved = MacroActionState("m_win", "cma_local", 1, 10.0, 5.0, 1, 1)
+    improved.record(9.5, True, 0.0)
+    reward, components = improved.reward(phase="late")
+    assert reward >= 0.55
+    assert components["objective_success"] == 1.0
+
+
+def test_v51_trust_uses_objective_success_and_exploration_failure_cooldown() -> None:
+    control = PortfolioWMBOState(WMBOControlConfig(failure_cooldown_trials=2))
+    assert control.recent_success_rates()["global_sobol"] == pytest.approx(0.5)
+
+    cooldown = None
+    for trial in (3, 6, 9):
+        cooldown = control.record_delayed_reward(
+            "global_sobol", reward=0.15, trial_number=trial, improved=False
+        )
+    assert cooldown == 12
+    assert control.cooldown_until["global_sobol"] == 12
+    assert control.recent_success_rates()["global_sobol"] < 0.5
+    assert control.trusts["global_sobol"] < 0.5
+
+    before = control.trusts["cma_local"]
+    control.record_delayed_reward("cma_local", reward=0.60, trial_number=10, improved=True)
+    assert control.trusts["cma_local"] > before
+    assert control.recent_success_rates()["cma_local"] > 0.5
+
+
+def test_v51_rc3_penalises_stale_dominant_local_operator_without_masking() -> None:
+    control = PortfolioWMBOState(WMBOControlConfig(trust_window=5))
+    control.executed_strategies.extend(
+        ["cma_local"] * 9 + ["gp_ei", "anisotropic_turbo", "gp_ei"]
+    )
+    for _ in range(4):
+        control.outcomes["cma_local"].append(False)
+
+    penalties, reasons, shares = control.local_routing_penalties()
+    assert shares["cma_local"] == pytest.approx(0.75)
+    assert penalties["cma_local"] == pytest.approx(0.65)
+    assert "stale_local_dominance" in reasons["cma_local"]
+    assert penalties["gp_ei"] == pytest.approx(1.0)
+
+    context = control.decision_context(
+        phase="middle", trial_number=20, completed_trials=19, budget=40, uncertainty=0.2
+    )
+    assert "cma_local" in context.allowed_strategies
+    assert context.strategy_routing_penalties["cma_local"] == pytest.approx(0.65)
+
+
+def test_v51_rc3_dominance_penalty_clears_after_recent_macro_success() -> None:
+    control = PortfolioWMBOState(WMBOControlConfig(trust_window=5))
+    control.executed_strategies.extend(["cma_local"] * 10 + ["gp_ei"] * 2)
+    control.outcomes["cma_local"].extend([False, False, False, True])
+    penalties, reasons, shares = control.local_routing_penalties()
+    assert shares["cma_local"] > 0.70
+    assert penalties["cma_local"] == pytest.approx(1.0)
+    assert "cma_local" not in reasons
+
+
+def test_v51_rc3_penalises_evidence_gated_underperforming_local_operator() -> None:
+    control = PortfolioWMBOState(WMBOControlConfig(trust_window=5))
+    # Keep recent evaluation shares balanced so this test isolates performance evidence.
+    control.executed_strategies.extend(
+        ["gp_ei", "cma_local", "anisotropic_turbo"] * 4
+    )
+    control.outcomes["gp_ei"].extend([False, False, False, False, False])
+    control.outcomes["cma_local"].extend([True, True, True, True, False])
+    control.outcomes["anisotropic_turbo"].extend([False, True, False, True, False])
+
+    penalties, reasons, _ = control.local_routing_penalties()
+    assert control.recent_success_rates()["gp_ei"] == pytest.approx(1.0 / 7.0)
+    assert control.recent_success_rates()["cma_local"] == pytest.approx(5.0 / 7.0)
+    assert penalties["gp_ei"] == pytest.approx(0.65)
+    assert "evidence_gated_underperformance" in reasons["gp_ei"]
+    assert penalties["cma_local"] == pytest.approx(1.0)
+
+
+def test_v51_rc3_penalty_does_not_stack_when_both_reasons_apply() -> None:
+    control = PortfolioWMBOState(WMBOControlConfig(trust_window=5))
+    control.executed_strategies.extend(["gp_ei"] * 9 + ["cma_local"] * 3)
+    control.outcomes["gp_ei"].extend([False] * 5)
+    control.outcomes["cma_local"].extend([True] * 5)
+    penalties, reasons, _ = control.local_routing_penalties()
+    assert penalties["gp_ei"] == pytest.approx(0.65)
+    assert set(reasons["gp_ei"]) == {
+        "stale_local_dominance",
+        "evidence_gated_underperformance",
+    }
+
+
+def test_v51_new_best_follow_up_is_portfolio_local_only() -> None:
+    control = PortfolioWMBOState(WMBOControlConfig())
+    control.record_outcome(
+        strategy="gp_ucb",
+        trial_number=4,
+        improved=True,
+        y=0.8,
+        best_y=0.8,
+        update_trust=False,
+    )
+    context = control.decision_context(
+        phase="early",
+        trial_number=5,
+        completed_trials=4,
+        budget=20,
+        uncertainty=1.0,
+        coverage=0.1,
+        weakly_identified=1.0,
+        modality_label="highly_multimodal",
+        has_feasible_observation=True,
+    )
+    assert set(context.allowed_strategies) == {"gp_ei", "anisotropic_turbo", "cma_local"}
+    assert "new_best_local_follow_up_local_only" in context.gate_reasons
+    assert context.forced_strategy is None
+
+
+def test_v51_sparse_exploration_gates_do_not_reexplore_immediately() -> None:
+    control = PortfolioWMBOState(WMBOControlConfig())
+    first = control.decision_context(
+        phase="early",
+        trial_number=5,
+        completed_trials=4,
+        budget=30,
+        uncertainty=1.0,
+        coverage=0.9,
+        weakly_identified=0.22,
+        weakly_identified_top2=True,
+        regime_entropy=0.95,
+        modality_label="highly_multimodal",
+    )
+    assert "global_sobol" not in first.allowed_strategies
+    assert "gp_ucb" not in first.allowed_strategies
+    assert "early_global_sparse_gate" in first.gate_reasons
+    assert "early_ucb_sparse_gate" in first.gate_reasons
+
+    control.executed_strategies.extend(["gp_ei"] * 6)
+    control.consecutive_no_improvement = 2
+    later = control.decision_context(
+        phase="early",
+        trial_number=11,
+        completed_trials=10,
+        budget=30,
+        uncertainty=0.9,
+        coverage=0.95,
+        weakly_identified=0.21,
+        weakly_identified_top2=True,
+        regime_entropy=0.9,
+    )
+    assert "global_sobol" in later.allowed_strategies
+    assert "gp_ucb" in later.allowed_strategies
+
+    control.consecutive_no_improvement = 1
+    middle = control.decision_context(
+        phase="middle",
+        trial_number=15,
+        completed_trials=14,
+        budget=30,
+        uncertainty=1.0,
+        coverage=1.0,
+        weakly_identified=0.2,
+        weakly_identified_top2=True,
+        regime_entropy=0.9,
+    )
+    assert "global_sobol" not in middle.allowed_strategies
+    assert "gp_ucb" not in middle.allowed_strategies
+
+
+def test_v51_global_emergency_probe_is_sparse_and_capped() -> None:
+    control = PortfolioWMBOState(WMBOControlConfig())
+    control.executed_strategies.extend(["gp_ei"] * 6)
+    control.consecutive_no_improvement = 3
+    context = control.decision_context(
+        phase="early",
+        trial_number=12,
+        completed_trials=11,
+        budget=40,
+        uncertainty=0.9,
+        weakly_identified=0.2,
+        weakly_identified_top2=True,
+        regime_entropy=0.9,
+    )
+    assert context.forced_strategy == "global_sobol"
+    assert context.forced_reason == "weak_identification_emergency_probe"
+
+    control.executed_strategies.extend(["global_sobol", "gp_ei", "gp_ei", "gp_ei", "gp_ei", "gp_ei", "gp_ei", "global_sobol"])
+    control.executed_strategies.extend(["gp_ei"] * 6)
+    capped = control.decision_context(
+        phase="early",
+        trial_number=26,
+        completed_trials=25,
+        budget=80,
+        uncertainty=0.95,
+        weakly_identified=0.2,
+        weakly_identified_top2=True,
+        regime_entropy=0.95,
+    )
+    assert "global_sobol" not in capped.allowed_strategies
+    assert "early_global_action_cap" in capped.gate_reasons
+
+def test_v51_candidate_information_weight_decays_by_phase() -> None:
+    surrogate = _CountingSurrogate()
+    x = np.asarray([[0.1, 0.2], [0.8, 0.7], [0.4, 0.5], [0.2, 0.9]])
+    y = np.asarray([4.0, 2.0, 1.0, 3.0])
+    weights = {}
+    for phase in ("early", "middle", "late"):
+        options = _build_portfolio_candidate_options(
+            surrogate=surrogate,
+            observed_x=x,
+            observed_y=y,
+            dim=2,
+            n_pool=8,
+            n_options_per_strategy=1,
+            seed=21,
+            active_hypotheses=[],
+            phase=phase,
+            information_gain_weight=0.35,
+            world_model_entropy=0.5,
+            constraint_surrogate=None,
+            has_feasible_observation=True,
+            feasibility_floor=0.05,
+            best_x=x[2],
+            feasible_x=x,
+            lengthscales=[0.2, 0.8],
+            turbo_state=TurboState(dim=2),
+            cma_state=OnePlusOneCMAState(dim=2, seed=22),
+        )
+        weights[phase] = options[0]["information_gain_weight_effective"]
+    assert weights["early"] == pytest.approx(0.35 * 0.75)
+    assert weights["middle"] == pytest.approx(0.35 * 0.35)
+    assert weights["late"] == pytest.approx(0.35 * 0.10)
+    assert weights["early"] > weights["middle"] > weights["late"]
+
+
+
+def test_v51_late_candidates_are_optimisation_only() -> None:
+    surrogate = _CountingSurrogate()
+    x = np.asarray([[0.1, 0.2], [0.8, 0.7], [0.4, 0.5], [0.2, 0.9]])
+    y = np.asarray([4.0, 2.0, 1.0, 3.0])
+    options = _build_portfolio_candidate_options(
+        surrogate=surrogate,
+        observed_x=x,
+        observed_y=y,
+        dim=2,
+        n_pool=8,
+        n_options_per_strategy=3,
+        seed=41,
+        active_hypotheses=[{"hypothesis_id": "h1", "status": "active", "region_center": [0.4, 0.5], "region_radius": 0.2}],
+        phase="late",
+        information_gain_weight=0.35,
+        world_model_entropy=0.8,
+        constraint_surrogate=None,
+        has_feasible_observation=True,
+        feasibility_floor=0.05,
+        best_x=x[2],
+        feasible_x=x,
+        lengthscales=[0.2, 0.8],
+        turbo_state=TurboState(dim=2),
+        cma_state=OnePlusOneCMAState(dim=2, seed=42),
+    )
+    assert options
+    assert {option["evidence_role"] for option in options} == {"optimize"}
+
+
 def test_portfolio_controller_masks_cma_until_feasible() -> None:
     control = PortfolioWMBOState(WMBOControlConfig())
     context = control.decision_context(
@@ -179,6 +548,49 @@ def test_portfolio_controller_masks_cma_until_feasible() -> None:
     )
     assert "cma_local" not in context.allowed_strategies
     assert "cma_local_requires_feasible_observation" in context.gate_reasons
+
+
+
+def test_v51_routing_weights_change_by_phase() -> None:
+    expected = {
+        "early": {"landscape": 0.25, "geometry": 0.20, "candidate": 0.35, "history": 0.20},
+        "middle": {"landscape": 0.20, "geometry": 0.30, "candidate": 0.30, "history": 0.20},
+        "late": {"landscape": 0.15, "geometry": 0.30, "candidate": 0.30, "history": 0.25},
+    }
+    agent = WorldModelAgent({"mode": "portfolio_v5"})
+    for phase, target in expected.items():
+        decision = agent.decide(_agent_state(phase=phase))
+        weights = decision.metadata["routing_weights_effective"]
+        for name, value in target.items():
+            assert weights[name] == pytest.approx(value)
+        assert decision.metadata["rule_policy_version"] == "5.1-rc3"
+
+
+def test_v51_rc3_agent_applies_soft_routing_penalty_after_base_score() -> None:
+    base = _agent_state(phase="middle")
+    context = dict(base.decision_context)
+    context["strategy_routing_penalties"] = {"cma_local": 0.65}
+    context["strategy_penalty_reasons"] = {"cma_local": ["stale_local_dominance"]}
+    context["local_operator_recent_shares"] = {
+        "gp_ei": 0.1, "anisotropic_turbo": 0.15, "cma_local": 0.75
+    }
+    state = AgentState(
+        observed_x=base.observed_x,
+        observed_y=base.observed_y,
+        descriptor=base.descriptor,
+        budget_used=base.budget_used,
+        budget_total=base.budget_total,
+        candidate_options=base.candidate_options,
+        decision_context=context,
+    )
+    decision = WorldModelAgent({"mode": "portfolio_v5"}).decide(state)
+    pre = decision.metadata["strategy_scores_pre_penalty"]["cma_local"]
+    post = decision.metadata["strategy_scores"]["cma_local"]
+    assert post == pytest.approx(0.65 * pre)
+    assert decision.metadata["strategy_score_penalties"]["cma_local"] == pytest.approx(0.65)
+    assert decision.metadata["strategy_penalty_reasons"]["cma_local"] == [
+        "stale_local_dominance"
+    ]
 
 
 def test_portfolio_rule_only_selects_legal_strategy_and_candidate() -> None:
@@ -245,6 +657,7 @@ def test_each_operator_uses_one_candidate_pool_prediction() -> None:
         n_options_per_strategy=3,
         seed=11,
         active_hypotheses=[],
+        phase="middle",
         information_gain_weight=0.35,
         world_model_entropy=0.5,
         constraint_surrogate=None,
@@ -274,6 +687,7 @@ def test_cma_masks_itself_when_eightfold_pool_fails_pof_threshold() -> None:
         n_options_per_strategy=1,
         seed=13,
         active_hypotheses=[],
+        phase="middle",
         information_gain_weight=0.35,
         world_model_entropy=0.5,
         constraint_surrogate=_RejectingConstraint(),

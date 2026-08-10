@@ -14,9 +14,12 @@ from .acquisition import AcquisitionInput, expected_improvement, score_candidate
 from .agents import AgentState, CandidateValidator, ReasoningDecision, WorldModelAgent
 from .portfolio import (
     MACRO_DURATIONS,
+    V51_SUCCESSFUL_MACRO_MAX_STEPS,
     MacroActionState,
     OnePlusOneCMAState,
+    PORTFOLIO_POLICY_VERSION,
     PORTFOLIO_STRATEGIES,
+    V51_CANDIDATE_INFORMATION_MULTIPLIERS,
     TurboState,
     objective_scale,
     portfolio_shape,
@@ -558,15 +561,22 @@ class WMBOOptimizer:
             return None
         macro = self._macro_action
         macro.termination_reason = str(reason)
-        reward, components = macro.reward()
-        self._control.record_delayed_reward(
-            macro.strategy, reward=reward, trial_number=trial_number
+        macro_phase = self._control.budget_phase(
+            max(0, macro.start_trial - 1), self.config.budget
+        )
+        reward, components = macro.reward(phase=macro_phase)
+        cooldown_until = self._control.record_delayed_reward(
+            macro.strategy,
+            reward=reward,
+            trial_number=trial_number,
+            improved=bool(components.get("objective_success", 0.0) > 0.5),
         )
         summary = {
-            **macro.to_dict(),
+            **macro.to_dict(phase=macro_phase),
             "macro_continued": False,
             "macro_reward": reward,
             "macro_reward_components": components,
+            "macro_cooldown_until": cooldown_until,
         }
         self._macro_action = None
         return summary
@@ -687,6 +697,7 @@ class WMBOOptimizer:
                 ),
                 seed=self.config.seed + 25_000 + state.step,
                 active_hypotheses=active_hypotheses,
+                phase=phase,
                 information_gain_weight=float(self._control.config.information_gain_weight),
                 world_model_entropy=float(
                     descriptor.calibration.get("world_model_entropy", 1.0)
@@ -746,6 +757,25 @@ class WMBOOptimizer:
         }
         if self._portfolio_v5:
             context_kwargs["has_feasible_observation"] = bool(np.any(feasible))
+            context_kwargs["coverage"] = float(descriptor.coverage)
+            regime_values = {
+                str(name): float(value)
+                for name, value in descriptor.regime_posteriors.items()
+            }
+            weak_value = float(regime_values.get("weakly_identified", 1.0))
+            ordered_regimes = sorted(regime_values.values(), reverse=True)
+            top2_cutoff = ordered_regimes[min(1, len(ordered_regimes) - 1)] if ordered_regimes else 1.0
+            probability_vector = np.asarray(list(regime_values.values()), dtype=float)
+            probability_vector /= max(float(np.sum(probability_vector)), 1.0e-12)
+            regime_entropy = float(
+                -np.sum(
+                    probability_vector
+                    * np.log(np.clip(probability_vector, 1.0e-12, 1.0))
+                ) / math.log(max(2, len(probability_vector)))
+            ) if len(probability_vector) else 1.0
+            context_kwargs["weakly_identified"] = weak_value
+            context_kwargs["weakly_identified_top2"] = bool(weak_value >= top2_cutoff - 1.0e-12)
+            context_kwargs["regime_entropy"] = regime_entropy
             context_kwargs["available_strategies"] = sorted(
                 {
                     str(option.get("strategy"))
@@ -782,6 +812,7 @@ class WMBOOptimizer:
                 metadata={
                     "source": "macro_continuation",
                     "rule_policy_mode": "portfolio_v5",
+                    "rule_policy_version": PORTFOLIO_POLICY_VERSION,
                     "allowed_strategies": list(strategy_context.allowed_strategies),
                     "forced_strategy": self._macro_action.strategy,
                 },
@@ -938,7 +969,16 @@ class WMBOOptimizer:
             "override_reason": override_reason,
             "allowed_strategies": sorted(allowed_strategies),
             "strategy_scores": decision.metadata.get("strategy_scores"),
+            "strategy_scores_pre_penalty": decision.metadata.get("strategy_scores_pre_penalty"),
+            "strategy_score_penalties": decision.metadata.get("strategy_score_penalties"),
+            "strategy_penalty_reasons": decision.metadata.get("strategy_penalty_reasons"),
+            "local_operator_recent_shares": decision.metadata.get("local_operator_recent_shares"),
             "score_components": decision.metadata.get("score_components"),
+            "routing_weights_effective": decision.metadata.get("routing_weights_effective"),
+            "rule_policy_version": decision.metadata.get(
+                "rule_policy_version",
+                PORTFOLIO_POLICY_VERSION if self._portfolio_v5 else None,
+            ),
             "masked_strategies": decision.metadata.get("masked_strategies", []),
             "forced_strategy": decision_context.get("forced_strategy"),
             "forced_reason": decision_context.get("forced_reason"),
@@ -976,7 +1016,8 @@ class WMBOOptimizer:
                 key: getattr(descriptor, key, None)
                 for key in (
                     "lengthscale_condition", "local_condition", "rotation_score",
-                    "effective_dimension", "valley_score",
+                    "effective_dimension", "valley_score", "geometry_reliability",
+                    "lengthscale_reliability",
                 )
             },
             "regime_posteriors": dict(descriptor.regime_posteriors),
@@ -1007,6 +1048,7 @@ class WMBOOptimizer:
             "joint_score": selected_option.get("joint_score"),
             "expected_improvement": selected_option.get("expected_improvement"),
             "information_gain": selected_option.get("information_gain"),
+            "information_gain_weight_effective": selected_option.get("information_gain_weight_effective"),
             "predicted_feasibility_probability": selected_option.get("predicted_feasibility_probability"),
             "predicted_constraint_log_ratio": selected_option.get("predicted_constraint_log_ratio"),
             "candidate_override": candidate_override,
@@ -1193,6 +1235,10 @@ class WMBOOptimizer:
                         self._pending_trial.get("information_gain", 0.0) or 0.0
                     ),
                 )
+                if improved:
+                    extension_ceiling = V51_SUCCESSFUL_MACRO_MAX_STEPS.get(strategy)
+                    if extension_ceiling is not None:
+                        self._macro_action.extend_after_success(extension_ceiling)
                 termination = self._macro_action.should_stop()
                 if updated.step >= self.config.budget:
                     termination = "budget_exhausted"
@@ -1653,6 +1699,7 @@ def _build_portfolio_candidate_options(
     n_options_per_strategy: int,
     seed: int,
     active_hypotheses: Sequence[Mapping[str, object]],
+    phase: str,
     information_gain_weight: float,
     world_model_entropy: float,
     constraint_surrogate: Any | None,
@@ -1672,7 +1719,16 @@ def _build_portfolio_candidate_options(
         item for item in active_hypotheses
         if str(item.get("status", "active")) == "active"
     ]
-    roles = ("optimize", "confirm", "falsify") if hypotheses else ("optimize",)
+    phase_key = str(phase).strip().lower()
+    roles = (
+        ("optimize",)
+        if phase_key == "late" or not hypotheses
+        else ("optimize", "confirm", "falsify")
+    )
+    phase_multiplier = V51_CANDIDATE_INFORMATION_MULTIPLIERS.get(phase_key, 0.35)
+    effective_information_weight = float(
+        np.clip(float(information_gain_weight) * phase_multiplier, 0.0, 0.85)
+    )
     shape = portfolio_shape(observed_x, observed_y, lengthscales)
     best_y = float(np.min(observed_y)) if len(observed_y) else 0.0
     cma_state.ensure(best_x, best_y, shape)
@@ -1792,8 +1848,8 @@ def _build_portfolio_candidate_options(
                 role_values = information
                 targets = [None] * len(pool)
             joint = (
-                (1.0 - information_gain_weight) * optimisation
-                + information_gain_weight * _scale_candidates_01(role_values)
+                (1.0 - effective_information_weight) * optimisation
+                + effective_information_weight * _scale_candidates_01(role_values)
             )
             order = np.argsort(-np.asarray(joint, dtype=float), kind="stable")
             selected_index = next(
@@ -1819,6 +1875,7 @@ def _build_portfolio_candidate_options(
                     "constrained_expected_improvement": float(constrained_ei[selected_index]),
                     "optimisation_utility": float(optimisation[selected_index]),
                     "information_gain": float(information[selected_index]),
+                    "information_gain_weight_effective": effective_information_weight,
                     "confirmation_value": float(confirmation[selected_index]),
                     "falsification_value": float(falsification[selected_index]),
                     "joint_score": float(joint[selected_index]),

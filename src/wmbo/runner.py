@@ -719,6 +719,7 @@ def _write_observations_csv(path: Path, observations: Sequence[Mapping[str, obje
         "penalty_weight",
         "failure_penalty",
         "strategy",
+        "rule_policy_version",
         "proposed_strategy",
         "executed_strategy",
         "override_reason",
@@ -729,6 +730,7 @@ def _write_observations_csv(path: Path, observations: Sequence[Mapping[str, obje
         "macro_step",
         "macro_min_steps",
         "macro_max_steps",
+        "macro_successful_extensions",
         "macro_continued",
         "macro_termination_reason",
         "macro_reward",
@@ -737,6 +739,15 @@ def _write_observations_csv(path: Path, observations: Sequence[Mapping[str, obje
         "operator_state_summary",
         "geometry_features",
         "regime_posteriors",
+        "routing_weights_effective",
+        "strategy_scores_pre_penalty",
+        "strategy_score_penalties",
+        "strategy_penalty_reasons",
+        "local_operator_recent_shares",
+        "geometry_reliability",
+        "lengthscale_reliability",
+        "regime_entropy",
+        "weakly_identified_top2",
         "lengthscale_condition",
         "local_condition",
         "rotation_score",
@@ -800,7 +811,10 @@ def _write_observations_csv(path: Path, observations: Sequence[Mapping[str, obje
             row["x_raw"] = _format_vector(row.get("x_raw"))
             row["hypothesis_region_center"] = _format_vector(row.get("hypothesis_region_center"))
             row["hypothesis_sensitive_dims"] = _format_vector(row.get("hypothesis_sensitive_dims"))
-            for key in ("strategy_trust", "strategy_success_rates", "hypothesis_status_counts"):
+            for key in (
+                "strategy_trust", "strategy_success_rates", "hypothesis_status_counts",
+                "routing_weights_effective",
+            ):
                 row[key] = _format_mapping(row.get(key))
             writer.writerow({name: row.get(name) for name in fieldnames})
 
@@ -1098,7 +1112,13 @@ def _extract_observation_metadata(state_metadata: Mapping[str, object]) -> dict[
         "allowed_strategies": decision.get("allowed_strategies"),
         "masked_strategies": decision.get("masked_strategies"),
         "strategy_scores": decision.get("strategy_scores"),
+        "strategy_scores_pre_penalty": decision.get("strategy_scores_pre_penalty"),
+        "strategy_score_penalties": decision.get("strategy_score_penalties"),
+        "strategy_penalty_reasons": decision.get("strategy_penalty_reasons"),
+        "local_operator_recent_shares": decision.get("local_operator_recent_shares"),
         "score_components": decision.get("score_components"),
+        "routing_weights_effective": decision.get("routing_weights_effective"),
+        "rule_policy_version": decision.get("rule_policy_version"),
         "forced_strategy": decision.get("forced_strategy"),
         "forced_reason": decision.get("forced_reason"),
         "strategy_gate_reasons": decision.get("strategy_gate_reasons"),
@@ -1113,6 +1133,7 @@ def _extract_observation_metadata(state_metadata: Mapping[str, object]) -> dict[
         "macro_step": decision.get("macro_step"),
         "macro_min_steps": decision.get("macro_min_steps"),
         "macro_max_steps": decision.get("macro_max_steps"),
+        "macro_successful_extensions": decision.get("macro_successful_extensions"),
         "macro_continued": decision.get("macro_continued"),
         "previous_macro_settlement": decision.get("previous_macro_settlement"),
         "macro_termination_reason": decision.get("macro_termination_reason"),
@@ -1125,6 +1146,8 @@ def _extract_observation_metadata(state_metadata: Mapping[str, object]) -> dict[
         "rotation_score": geometry_map.get("rotation_score"),
         "effective_dimension": geometry_map.get("effective_dimension"),
         "valley_score": geometry_map.get("valley_score"),
+        "geometry_reliability": geometry_map.get("geometry_reliability"),
+        "lengthscale_reliability": geometry_map.get("lengthscale_reliability"),
         "regime_separable_smooth": regime_map.get("separable_smooth"),
         "regime_rotated_ill_conditioned": regime_map.get("rotated_ill_conditioned"),
         "regime_curved_valley": regime_map.get("curved_valley"),
@@ -1132,6 +1155,16 @@ def _extract_observation_metadata(state_metadata: Mapping[str, object]) -> dict[
         "regime_weakly_identified": regime_map.get("weakly_identified"),
         "regime_posteriors": decision.get("regime_posteriors"),
         "consecutive_no_improvement": control_map.get("consecutive_no_improvement"),
+        "weakly_identified_top2": (
+            decision.get("strategy_decision_context", {}) or {}
+        ).get("weakly_identified_top2") if isinstance(
+            decision.get("strategy_decision_context"), Mapping
+        ) else None,
+        "regime_entropy": (
+            decision.get("strategy_decision_context", {}) or {}
+        ).get("regime_entropy") if isinstance(
+            decision.get("strategy_decision_context"), Mapping
+        ) else None,
         "hypothesis_id": decision.get("hypothesis_id"),
         "hypothesis_status": decision.get("hypothesis_status"),
         "hypothesis_region_center": decision.get("hypothesis_region_center"),

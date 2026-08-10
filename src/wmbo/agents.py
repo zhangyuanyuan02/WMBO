@@ -9,7 +9,11 @@ from typing import Mapping, Sequence
 import numpy as np
 
 from .control import STRATEGIES
-from .portfolio import PORTFOLIO_STRATEGIES
+from .portfolio import (
+    PORTFOLIO_POLICY_VERSION,
+    PORTFOLIO_STRATEGIES,
+    V51_ROUTING_WEIGHT_MULTIPLIERS,
+)
 
 Vector = Sequence[float]
 Matrix = Sequence[Vector]
@@ -450,23 +454,36 @@ class WorldModelAgent:
             strategy: _bounded(trusts.get(strategy), 0.5)
             for strategy in PORTFOLIO_STRATEGIES
         }
+        phase = str(context.get("budget_phase") or _phase_from_progress(progress))
+        phase_multipliers = V51_ROUTING_WEIGHT_MULTIPLIERS.get(
+            phase, V51_ROUTING_WEIGHT_MULTIPLIERS["middle"]
+        )
         weights = np.asarray(
             [
-                self.config.landscape_weight,
-                self.config.geometry_weight,
-                self.config.candidate_weight,
-                self.config.history_weight,
+                self.config.landscape_weight * phase_multipliers["landscape"],
+                self.config.geometry_weight * phase_multipliers["geometry"],
+                self.config.candidate_weight * phase_multipliers["candidate"],
+                self.config.history_weight * phase_multipliers["history"],
             ],
             dtype=float,
         )
         weights /= max(float(np.sum(weights)), 1e-12)
-        raw_scores = {
+        pre_penalty_scores = {
             strategy: float(
                 weights[0] * landscape_scores[strategy]
                 + weights[1] * geometry_scores[strategy]
                 + weights[2] * candidate_scores[strategy]
                 + weights[3] * history_scores[strategy]
             )
+            for strategy in PORTFOLIO_STRATEGIES
+        }
+        configured_penalties = dict(context.get("strategy_routing_penalties", {}) or {})
+        score_penalties = {
+            strategy: float(np.clip(float(configured_penalties.get(strategy, 1.0)), 0.0, 1.0))
+            for strategy in PORTFOLIO_STRATEGIES
+        }
+        raw_scores = {
+            strategy: float(pre_penalty_scores[strategy] * score_penalties[strategy])
             for strategy in PORTFOLIO_STRATEGIES
         }
 
@@ -535,6 +552,17 @@ class WorldModelAgent:
                     item: raw_scores[item] if item in allowed else None
                     for item in PORTFOLIO_STRATEGIES
                 },
+                "strategy_scores_pre_penalty": {
+                    item: pre_penalty_scores[item] if item in allowed else None
+                    for item in PORTFOLIO_STRATEGIES
+                },
+                "strategy_score_penalties": score_penalties,
+                "strategy_penalty_reasons": dict(
+                    context.get("strategy_penalty_reasons", {}) or {}
+                ),
+                "local_operator_recent_shares": dict(
+                    context.get("local_operator_recent_shares", {}) or {}
+                ),
                 "score_components": {
                     item: {
                         "landscape": landscape_scores[item],
@@ -549,10 +577,17 @@ class WorldModelAgent:
                     key: descriptor.get(key)
                     for key in (
                         "lengthscale_condition", "local_condition", "rotation_score",
-                        "effective_dimension", "valley_score",
+                        "effective_dimension", "valley_score", "geometry_reliability",
+                        "lengthscale_reliability",
                     )
                 },
                 "regime_posteriors": posteriors,
+                "routing_weights_effective": {
+                    "landscape": float(weights[0]),
+                    "geometry": float(weights[1]),
+                    "candidate": float(weights[2]),
+                    "history": float(weights[3]),
+                },
                 "allowed_strategies": [
                     item for item in PORTFOLIO_STRATEGIES if item in allowed
                 ],
@@ -565,7 +600,8 @@ class WorldModelAgent:
                 "selected_candidate_evidence": dict(selected) if selected is not None else None,
                 "source": "rule",
                 "rule_policy_mode": self.config.mode,
-                "budget_phase": str(context.get("budget_phase") or _phase_from_progress(progress)),
+                "rule_policy_version": PORTFOLIO_POLICY_VERSION,
+                "budget_phase": phase,
             },
         )
     def _decide_continuous(self, state: AgentState) -> ReasoningDecision:

@@ -7,9 +7,23 @@ from dataclasses import dataclass, field
 import math
 from typing import Any, Mapping, Sequence
 
+import numpy as np
+
 from .portfolio import (
     PORTFOLIO_EXPLORATION_STRATEGIES,
+    PORTFOLIO_LOCAL_STRATEGIES,
     PORTFOLIO_STRATEGIES,
+    V51_EXPLORATION_FAILURE_WINDOW,
+    V51_EXPLORATION_GATES,
+    V51_REWARD_EMA_ALPHA,
+    V51_REWARD_REFERENCE,
+    V51_TRUST_ALPHA,
+    V51_RC3_LOCAL_DOMINANCE_WINDOW,
+    V51_RC3_LOCAL_DOMINANCE_SHARE,
+    V51_RC3_RECENT_FAILURE_MACROS,
+    V51_RC3_UNDERPERFORM_MIN_MACROS,
+    V51_RC3_UNDERPERFORM_RATIO,
+    V51_RC3_ROUTING_PENALTY,
 )
 
 STRATEGIES = ("global_diverse", "explore_ucb", "exploit_ei", "trust_region")
@@ -158,6 +172,11 @@ class StrategyDecisionContext:
     steps_since_exploration: int
     strategy_trust: Mapping[str, float]
     strategy_success_rates: Mapping[str, float]
+    strategy_routing_penalties: Mapping[str, float] = field(default_factory=dict)
+    strategy_penalty_reasons: Mapping[str, Sequence[str]] = field(default_factory=dict)
+    local_operator_recent_shares: Mapping[str, float] = field(default_factory=dict)
+    weakly_identified_top2: bool = False
+    regime_entropy: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-friendly representation for agents and logs."""
@@ -176,6 +195,14 @@ class StrategyDecisionContext:
             "steps_since_exploration": self.steps_since_exploration,
             "strategy_trust": dict(self.strategy_trust),
             "strategy_success_rates": dict(self.strategy_success_rates),
+            "strategy_routing_penalties": dict(self.strategy_routing_penalties),
+            "strategy_penalty_reasons": {
+                str(strategy): list(reasons)
+                for strategy, reasons in self.strategy_penalty_reasons.items()
+            },
+            "local_operator_recent_shares": dict(self.local_operator_recent_shares),
+            "weakly_identified_top2": bool(self.weakly_identified_top2),
+            "regime_entropy": float(self.regime_entropy),
         }
 
 
@@ -870,9 +897,10 @@ def _normalise_sensitive_dims(value: Sequence[int] | None) -> list[int]:
 
 @dataclass
 class PortfolioWMBOState(WMBOState):
-    """Controller profile for the five portfolio-v5 operators."""
+    """Controller profile for the five operators under the formal V5.1 policy."""
 
     has_feasible_observation: bool = True
+    reward_history: dict[str, deque[float]] = field(init=False)
 
     def __post_init__(self) -> None:
         self.trusts = {
@@ -882,48 +910,198 @@ class PortfolioWMBOState(WMBOState):
             strategy: deque(maxlen=max(1, int(self.config.trust_window)))
             for strategy in PORTFOLIO_STRATEGIES
         }
+        self.reward_history = {
+            strategy: deque(maxlen=max(1, int(self.config.trust_window)))
+            for strategy in PORTFOLIO_STRATEGIES
+        }
         self.cooldown_until = defaultdict(int)
+
+    def recent_success_rates(self) -> dict[str, float]:
+        """Return Bayesian-smoothed objective-success rates.
+
+        Untried operators stay neutral at 0.5 instead of looking either perfect or
+        failed.  The Beta(1, 1) prior also prevents one macro from dominating.
+        """
+
+        return {
+            strategy: (
+                (sum(bool(value) for value in values) + 1.0) / (len(values) + 2.0)
+                if values else 0.5
+            )
+            for strategy, values in self.outcomes.items()
+        }
+
+    def recent_reward_quality(self) -> dict[str, float]:
+        """Return scale-normalised recent macro reward quality."""
+
+        result: dict[str, float] = {}
+        for strategy, values in self.reward_history.items():
+            if not values:
+                result[strategy] = 0.5
+                continue
+            iterator = iter(values)
+            ema = float(next(iterator))
+            for value in iterator:
+                ema = (1.0 - V51_REWARD_EMA_ALPHA) * ema + V51_REWARD_EMA_ALPHA * float(value)
+            result[strategy] = float(np.clip(ema / V51_REWARD_REFERENCE, 0.0, 1.0))
+        return result
+
+    def recent_local_operator_shares(self) -> dict[str, float]:
+        """Return local-operator shares over RC3's rolling evaluation window."""
+
+        local = tuple(PORTFOLIO_LOCAL_STRATEGIES)
+        window = list(self.executed_strategies)[-V51_RC3_LOCAL_DOMINANCE_WINDOW:]
+        if len(window) < V51_RC3_LOCAL_DOMINANCE_WINDOW:
+            return {strategy: 0.0 for strategy in local}
+        denominator = float(len(window))
+        return {
+            strategy: float(sum(item == strategy for item in window) / denominator)
+            for strategy in local
+        }
+
+    def local_routing_penalties(
+        self,
+    ) -> tuple[dict[str, float], dict[str, tuple[str, ...]], dict[str, float]]:
+        """Return RC3 soft penalties for stale local-operator lock-in.
+
+        Dominance suppression uses evaluation share but requires four recent failed
+        macros. Underperformance suppression requires at least five completed
+        macros and compares Bayesian-smoothed objective success with the best local
+        arm. Both are soft 0.65 multipliers and deliberately do not stack.
+        """
+
+        local = tuple(PORTFOLIO_LOCAL_STRATEGIES)
+        shares = self.recent_local_operator_shares()
+        success_rates = self.recent_success_rates()
+        penalties = {strategy: 1.0 for strategy in PORTFOLIO_STRATEGIES}
+        reasons: dict[str, list[str]] = {strategy: [] for strategy in PORTFOLIO_STRATEGIES}
+        best_local_success = max((success_rates[strategy] for strategy in local), default=0.5)
+
+        for strategy in local:
+            macro_outcomes = list(self.outcomes[strategy])
+            recent_failures = (
+                len(macro_outcomes) >= V51_RC3_RECENT_FAILURE_MACROS
+                and not any(macro_outcomes[-V51_RC3_RECENT_FAILURE_MACROS:])
+            )
+            if shares[strategy] >= V51_RC3_LOCAL_DOMINANCE_SHARE and recent_failures:
+                penalties[strategy] = min(penalties[strategy], V51_RC3_ROUTING_PENALTY)
+                reasons[strategy].append("stale_local_dominance")
+
+            if (
+                len(macro_outcomes) >= V51_RC3_UNDERPERFORM_MIN_MACROS
+                and recent_failures
+                and best_local_success > 0.0
+                and success_rates[strategy] < V51_RC3_UNDERPERFORM_RATIO * best_local_success
+            ):
+                penalties[strategy] = min(penalties[strategy], V51_RC3_ROUTING_PENALTY)
+                reasons[strategy].append("evidence_gated_underperformance")
+
+        return (
+            penalties,
+            {strategy: tuple(items) for strategy, items in reasons.items() if items},
+            shares,
+        )
 
     def decision_context(
         self,
         *,
+        phase: str,
+        trial_number: int,
+        completed_trials: int,
+        budget: int,
+        uncertainty: float,
+        smoothness_label: str = "unknown",
+        modality_label: str = "unknown",
+        flexible_local_follow_up: bool = False,
         has_feasible_observation: bool = True,
         available_strategies: Sequence[str] | None = None,
-        **kwargs: Any,
+        coverage: float = 0.0,
+        weakly_identified: float = 1.0,
+        weakly_identified_top2: bool = False,
+        regime_entropy: float = 0.0,
     ) -> StrategyDecisionContext:
+        del smoothness_label, modality_label, flexible_local_follow_up
         self.has_feasible_observation = bool(has_feasible_observation)
-        context = super().decision_context(**kwargs)
-        if available_strategies is None:
-            return context
-        available = {
-            str(strategy) for strategy in available_strategies
-            if str(strategy) in PORTFOLIO_STRATEGIES
-        }
-        allowed = tuple(
-            strategy for strategy in context.allowed_strategies if strategy in available
+        allowed, gate_reasons = self.allowed_strategies(
+            phase,
+            trial_number,
+            uncertainty,
+            coverage=coverage,
+            weakly_identified=weakly_identified,
+            weakly_identified_top2=weakly_identified_top2,
+            regime_entropy=regime_entropy,
         )
-        reasons = tuple(context.gate_reasons) + tuple(
-            f"{strategy}_candidate_unavailable"
-            for strategy in PORTFOLIO_STRATEGIES
-            if strategy not in available
+
+        # A newly improved incumbent must be exploited locally on the next routing
+        # boundary.  V5 used legacy names (trust_region/exploit_ei), so this gate
+        # silently failed for portfolio operators.
+        if self.follow_up_local:
+            allowed.intersection_update(PORTFOLIO_LOCAL_STRATEGIES)
+            gate_reasons.append("new_best_local_follow_up_local_only")
+            if not allowed:
+                allowed.update({"gp_ei", "anisotropic_turbo"})
+                gate_reasons.append("new_best_local_follow_up_fallback")
+
+        if available_strategies is not None:
+            available = {
+                str(strategy) for strategy in available_strategies
+                if str(strategy) in PORTFOLIO_STRATEGIES
+            }
+            allowed.intersection_update(available)
+            gate_reasons.extend(
+                f"{strategy}_candidate_unavailable"
+                for strategy in PORTFOLIO_STRATEGIES
+                if strategy not in available
+            )
+            if not allowed:
+                local_available = PORTFOLIO_LOCAL_STRATEGIES.intersection(available)
+                if local_available:
+                    allowed.update(local_available)
+                    gate_reasons.append("fallback_available_local_strategies_enabled")
+                else:
+                    raise ValueError("No portfolio strategy produced a valid candidate.")
+
+        forced_strategy = None
+        forced_reason = None
+        global_actions = sum(
+            1 for strategy in self.executed_strategies if strategy == "global_sobol"
         )
-        if not allowed:
-            raise ValueError("No portfolio strategy produced a valid candidate.")
-        forced = context.forced_strategy if context.forced_strategy in allowed else None
+        if (
+            not self.follow_up_local
+            and str(phase) == "early"
+            and "global_sobol" in allowed
+            and global_actions == 0
+            and bool(weakly_identified_top2)
+            and self.consecutive_no_improvement >= 3
+        ):
+            # Guarantee at most one genuinely global emergency probe when the
+            # weak-identification regime remains prominent after sustained local
+            # stagnation.  Later global actions must win the portfolio score.
+            forced_strategy = "global_sobol"
+            forced_reason = "weak_identification_emergency_probe"
+            gate_reasons.append("early_global_emergency_probe")
+
+        routing_penalties, penalty_reasons, local_shares = self.local_routing_penalties()
+        total_budget = max(1, int(budget))
         return StrategyDecisionContext(
-            phase=context.phase,
-            trial_number=context.trial_number,
-            remaining_budget=context.remaining_budget,
-            remaining_ratio=context.remaining_ratio,
-            allowed_strategies=allowed,
-            forced_strategy=forced,
-            forced_reason=context.forced_reason if forced else None,
-            gate_reasons=reasons,
-            cooldown_until=context.cooldown_until,
-            consecutive_no_improvement=context.consecutive_no_improvement,
-            steps_since_exploration=context.steps_since_exploration,
-            strategy_trust=context.strategy_trust,
-            strategy_success_rates=context.strategy_success_rates,
+            phase=str(phase),
+            trial_number=int(trial_number),
+            remaining_budget=self.remaining_budget(completed_trials, total_budget),
+            remaining_ratio=max(0.0, (total_budget - int(completed_trials)) / total_budget),
+            allowed_strategies=tuple(strategy for strategy in self.trusts if strategy in allowed),
+            forced_strategy=forced_strategy,
+            forced_reason=forced_reason,
+            gate_reasons=tuple(gate_reasons),
+            cooldown_until={strategy: int(self.cooldown_until[strategy]) for strategy in self.trusts},
+            consecutive_no_improvement=int(self.consecutive_no_improvement),
+            steps_since_exploration=int(self._steps_since_exploration()),
+            strategy_trust=dict(self.trusts),
+            strategy_success_rates=self.recent_success_rates(),
+            strategy_routing_penalties=routing_penalties,
+            strategy_penalty_reasons=penalty_reasons,
+            local_operator_recent_shares=local_shares,
+            weakly_identified_top2=bool(weakly_identified_top2),
+            regime_entropy=float(regime_entropy),
         )
 
     def allowed_strategies(
@@ -932,35 +1110,93 @@ class PortfolioWMBOState(WMBOState):
         trial_number: int,
         uncertainty: float,
         modality_label: str = "unknown",
+        *,
+        coverage: float = 0.0,
+        weakly_identified: float = 1.0,
+        weakly_identified_top2: bool = False,
+        regime_entropy: float = 0.0,
     ) -> tuple[set[str], list[str]]:
+        del modality_label, coverage, weakly_identified
         allowed = set(PORTFOLIO_STRATEGIES)
         reasons: list[str] = []
         trial = int(trial_number)
+        uncertainty_value = float(np.clip(float(uncertainty), 0.0, 1.0))
+        entropy_value = float(np.clip(float(regime_entropy), 0.0, 1.0))
+        steps_since_exploration = self._steps_since_exploration()
+        global_actions = sum(
+            1 for strategy in self.executed_strategies if strategy == "global_sobol"
+        )
+
         for strategy in PORTFOLIO_EXPLORATION_STRATEGIES:
             if trial < int(self.cooldown_until[strategy]):
                 allowed.discard(strategy)
                 reasons.append(f"{strategy}_cooldown")
-        global_run = self._consecutive_strategy_count("global_sobol")
-        if phase == "early" and global_run >= self.config.global_max_consecutive_early:
-            allowed.discard("global_sobol")
-            reasons.append("early_global_consecutive_limit")
-        elif phase == "middle":
-            if global_run >= self.config.global_max_consecutive_middle:
+
+        # V5.1 formal sparse exploration.  Weak identification is evaluated
+        # relatively (top-two regime) or through regime entropy instead of an
+        # absolute posterior threshold.  This avoids the Stage-1 scale bug where
+        # Sobol and early UCB were practically impossible to trigger.
+        if phase == "early":
+            weak_or_ambiguous = bool(weakly_identified_top2) or (
+                entropy_value >= V51_EXPLORATION_GATES["early_global_regime_entropy"]
+            )
+            allow_global = (
+                weak_or_ambiguous
+                and uncertainty_value >= V51_EXPLORATION_GATES["early_global_uncertainty"]
+                and self.consecutive_no_improvement
+                >= int(V51_EXPLORATION_GATES["early_global_no_improvement"])
+                and steps_since_exploration
+                >= int(V51_EXPLORATION_GATES["early_global_interval"])
+                and global_actions
+                < int(V51_EXPLORATION_GATES["early_global_max_actions"])
+            )
+            if not allow_global:
                 allowed.discard("global_sobol")
-                reasons.append("middle_global_consecutive_limit")
-            if float(uncertainty) < self.config.middle_global_uncertainty_threshold:
-                allowed.discard("global_sobol")
-                reasons.append("middle_global_uncertainty_too_low")
-        elif phase == "late":
-            allowed.discard("global_sobol")
-            reasons.append("late_global_forbidden")
+                reasons.append("early_global_sparse_gate")
+            if global_actions >= int(V51_EXPLORATION_GATES["early_global_max_actions"]):
+                reasons.append("early_global_action_cap")
+
+            ucb_identification_evidence = bool(weakly_identified_top2) or (
+                entropy_value >= V51_EXPLORATION_GATES["early_ucb_regime_entropy"]
+            )
             allow_ucb = (
-                float(uncertainty) >= self.config.late_explore_uncertainty_threshold
-                and self.consecutive_no_improvement >= 2
+                ucb_identification_evidence
+                and uncertainty_value >= V51_EXPLORATION_GATES["early_ucb_uncertainty"]
+                and self.consecutive_no_improvement
+                >= int(V51_EXPLORATION_GATES["early_ucb_no_improvement"])
+                and steps_since_exploration
+                >= int(V51_EXPLORATION_GATES["early_ucb_interval"])
             )
             if not allow_ucb:
                 allowed.discard("gp_ucb")
-                reasons.append("late_exploration_gate")
+                reasons.append("early_ucb_sparse_gate")
+        elif phase == "middle":
+            allowed.discard("global_sobol")
+            reasons.append("middle_global_forbidden")
+            allow_ucb = (
+                uncertainty_value >= V51_EXPLORATION_GATES["middle_ucb_uncertainty"]
+                and self.consecutive_no_improvement
+                >= int(V51_EXPLORATION_GATES["middle_ucb_no_improvement"])
+                and steps_since_exploration
+                >= int(V51_EXPLORATION_GATES["middle_ucb_interval"])
+            )
+            if not allow_ucb:
+                allowed.discard("gp_ucb")
+                reasons.append("middle_ucb_sparse_gate")
+        else:
+            allowed.discard("global_sobol")
+            reasons.append("late_global_forbidden")
+            allow_ucb = (
+                uncertainty_value >= V51_EXPLORATION_GATES["late_ucb_uncertainty"]
+                and self.consecutive_no_improvement
+                >= int(V51_EXPLORATION_GATES["late_ucb_no_improvement"])
+                and steps_since_exploration
+                >= int(V51_EXPLORATION_GATES["late_ucb_interval"])
+            )
+            if not allow_ucb:
+                allowed.discard("gp_ucb")
+                reasons.append("late_ucb_sparse_gate")
+
         if not self.has_feasible_observation:
             allowed.discard("cma_local")
             reasons.append("cma_local_requires_feasible_observation")
@@ -972,6 +1208,55 @@ class PortfolioWMBOState(WMBOState):
     def _exploration_strategy_names(self) -> set[str]:
         return set(PORTFOLIO_EXPLORATION_STRATEGIES)
 
+    def record_delayed_reward(
+        self,
+        strategy: str,
+        reward: float,
+        trial_number: int,
+        *,
+        improved: bool | None = None,
+    ) -> int | None:
+        """Update V5.1 trust from objective success plus scale-normalised reward."""
+
+        key = str(strategy).strip().lower().replace("-", "_")
+        if key not in self.trusts:
+            raise ValueError(f"Unknown strategy for delayed reward: {key}")
+        bounded = float(np.clip(float(reward), 0.0, 1.0))
+        success = bool(improved) if improved is not None else bounded >= 0.55
+        self.reward_history[key].append(bounded)
+        self.outcomes[key].append(success)
+
+        reward_quality = self.recent_reward_quality()[key]
+        success_rate = self.recent_success_rates()[key]
+        target = 0.60 * reward_quality + 0.40 * success_rate
+        alpha = V51_TRUST_ALPHA
+        self.trusts[key] = float(
+            np.clip((1.0 - alpha) * self.trusts[key] + alpha * target, 0.0, 1.0)
+        )
+
+        # Cooldown is now based on repeated *objective* failures, not reward==0.
+        # Information-only rewards therefore cannot keep a failed exploration arm
+        # permanently alive.
+        recent = self.outcomes[key]
+        failure_window = min(V51_EXPLORATION_FAILURE_WINDOW, recent.maxlen or 1)
+        if (
+            key in self._exploration_strategy_names()
+            and len(recent) >= failure_window
+            and not any(list(recent)[-failure_window:])
+        ):
+            cooldown = int(trial_number) + int(self.config.failure_cooldown_trials) + 1
+            self.cooldown_until[key] = cooldown
+            return cooldown
+        return None
+
+    def _steps_since_exploration(self) -> int:
+        # The initial design is itself a global exploration block.  Treat the first
+        # portfolio decision as zero steps since exploration instead of immediately
+        # satisfying the old multimodal interval.
+        if not self.executed_strategies:
+            return 0
+        return super()._steps_since_exploration()
+
     def _multimodal_exploration_guard(
         self,
         *,
@@ -980,17 +1265,14 @@ class PortfolioWMBOState(WMBOState):
         uncertainty: float,
         modality_label: str,
     ) -> str | None:
-        if modality_label not in {"multimodal", "highly_multimodal"}:
-            return None
-        exploratory = [item for item in ("gp_ucb", "global_sobol") if item in allowed]
-        if not exploratory or self._steps_since_exploration() < max(1, int(self.config.multimodal_explore_interval)):
-            return None
-        threshold = (
-            self.config.multimodal_late_explore_uncertainty_threshold
-            if phase == "late"
-            else self.config.multimodal_explore_uncertainty_threshold
-        )
-        return exploratory[0] if float(uncertainty) >= float(threshold) else None
+        del allowed, phase, uncertainty, modality_label
+        return None
+
+    def to_dict(self) -> dict[str, Any]:
+        result = super().to_dict()
+        result["reward_quality"] = self.recent_reward_quality()
+        result["policy_revision"] = "v5.1-rc3"
+        return result
 
 
 

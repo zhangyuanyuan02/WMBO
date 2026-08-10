@@ -65,6 +65,8 @@ class LandscapeDescriptor:
     rotation_score: float | None = None
     effective_dimension: float | None = None
     valley_score: float | None = None
+    geometry_reliability: float | None = None
+    lengthscale_reliability: float | None = None
     regime_posteriors: Mapping[str, float] = field(default_factory=dict)
     credible_intervals: Mapping[str, Sequence[float]] = field(default_factory=dict)
     calibration: Mapping[str, float] = field(default_factory=dict)
@@ -99,6 +101,8 @@ class LandscapeDescriptor:
             "rotation_score": self.rotation_score,
             "effective_dimension": self.effective_dimension,
             "valley_score": self.valley_score,
+            "geometry_reliability": self.geometry_reliability,
+            "lengthscale_reliability": self.lengthscale_reliability,
             "regime_posteriors": {
                 str(name): float(probability)
                 for name, probability in self.regime_posteriors.items()
@@ -273,11 +277,15 @@ def _with_probabilistic_world_model(descriptor: LandscapeDescriptor) -> Landscap
         modality=descriptor.modality,
         curvature=descriptor.curvature,
         uncertainty=descriptor.uncertainty,
+        coverage=descriptor.coverage,
+        world_model_entropy=calibration.get("world_model_entropy", 1.0),
         geometry={
             "lengthscale_condition": descriptor.lengthscale_condition,
             "local_condition": descriptor.local_condition,
             "rotation_score": descriptor.rotation_score,
             "effective_dimension": descriptor.effective_dimension,
+            "geometry_reliability": descriptor.geometry_reliability,
+            "lengthscale_reliability": descriptor.lengthscale_reliability,
         },
     )
     enriched = LandscapeDescriptor(
