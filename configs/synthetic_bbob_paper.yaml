@@ -17,7 +17,7 @@ experiment:
   initial_samples_per_dimension: 2
   shared_initial_design: sobol
   candidate_pool_size: 2048
-  output_dir: results/synthetic_bbob_paper_conservative
+  output_dir: results/synthetic_bbob_paper_v51_rc3_full_2400
 
 benchmark_suite:
   bbob:
@@ -30,13 +30,14 @@ optimizer:
     surrogate: gaussian_process
     noise_level: 1.0e-6
     rule_policy:
-      mode: continuous_v4
-      landscape_weight: 0.45
-      candidate_weight: 0.35
-      history_weight: 0.20
+      mode: portfolio_v5
+      landscape_weight: 0.25
+      geometry_weight: 0.30
+      candidate_weight: 0.30
+      history_weight: 0.15
       temperature: 0.20
   wmbo_control:
-    candidate_options_per_strategy: 5
+    candidate_options_per_strategy: 3
     hypothesis_alignment_weight: 0.15
     information_gain_weight: 0.35
     hypothesis_support_probability: 0.80
@@ -51,7 +52,7 @@ optimizer:
 execution:
   continue_on_error: true
   resume: true
-  workers: 32
+  workers: 16
 
 reporting:
   bootstrap_samples: 10000
