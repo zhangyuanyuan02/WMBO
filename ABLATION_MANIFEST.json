@@ -1,0 +1,27 @@
+{
+  "base_policy": "WMBO V5.1 RC3",
+  "purpose": "paper ablation experiments",
+  "experiments": {
+    "landscape_group_ablation": [
+      "v51_ablate_smoothness",
+      "v51_ablate_modality",
+      "v51_ablate_curvature",
+      "v51_ablate_geometry",
+      "v51_ablate_identifiability"
+    ],
+    "complete_landscape_ablation": [
+      "v51_no_landscape"
+    ],
+    "routing_ablation": [
+      "v51_route_context_only",
+      "v51_route_static_balanced"
+    ]
+  },
+  "new_runs": 768,
+  "formal_runs_per_variant": 96,
+  "validation": {
+    "full_pytest": "69 passed, 7 skipped, 0 failed",
+    "portfolio_pytest": "33 passed, 0 failed",
+    "end_to_end_smoke": "8/8 methods completed"
+  }
+}

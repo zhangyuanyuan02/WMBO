@@ -175,6 +175,7 @@ class StrategyDecisionContext:
     strategy_routing_penalties: Mapping[str, float] = field(default_factory=dict)
     strategy_penalty_reasons: Mapping[str, Sequence[str]] = field(default_factory=dict)
     local_operator_recent_shares: Mapping[str, float] = field(default_factory=dict)
+    strategy_evaluation_counts: Mapping[str, int] = field(default_factory=dict)
     weakly_identified_top2: bool = False
     regime_entropy: float = 0.0
 
@@ -201,6 +202,10 @@ class StrategyDecisionContext:
                 for strategy, reasons in self.strategy_penalty_reasons.items()
             },
             "local_operator_recent_shares": dict(self.local_operator_recent_shares),
+            "strategy_evaluation_counts": {
+                str(strategy): int(count)
+                for strategy, count in self.strategy_evaluation_counts.items()
+            },
             "weakly_identified_top2": bool(self.weakly_identified_top2),
             "regime_entropy": float(self.regime_entropy),
         }
@@ -1100,6 +1105,10 @@ class PortfolioWMBOState(WMBOState):
             strategy_routing_penalties=routing_penalties,
             strategy_penalty_reasons=penalty_reasons,
             local_operator_recent_shares=local_shares,
+            strategy_evaluation_counts={
+                strategy: int(sum(item == strategy for item in self.executed_strategies))
+                for strategy in PORTFOLIO_STRATEGIES
+            },
             weakly_identified_top2=bool(weakly_identified_top2),
             regime_entropy=float(regime_entropy),
         )

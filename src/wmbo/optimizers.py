@@ -26,7 +26,7 @@ from .portfolio import (
 )
 from .benchmarks import BenchmarkSpec, EvaluationResult, sample_unit_points
 from .control import STRATEGIES, OptimizerConfig, PortfolioWMBOState, WMBOControlConfig, WMBOState
-from .descriptors import LandscapeDescriptor, describe_landscape
+from .descriptors import LandscapeDescriptor, apply_landscape_ablation, describe_landscape
 from .surrogate import SurrogateDataset, make_surrogate
 from .llm_api import LLMAPIError, OpenAIStyleClient, decide_with_llm
 
@@ -674,6 +674,11 @@ class WMBOOptimizer:
                     "mean_std": float(np.mean(descriptor_prediction.std)) if descriptor_prediction.std else 1.0,
                 },
             )
+        descriptor_unablated = descriptor
+        descriptor = apply_landscape_ablation(
+            descriptor,
+            self._agent.config.landscape_ablation,
+        )
         phase = self._control.budget_phase(state.step, self.config.budget)
         hypothesis_tracking = not _truthy(
             self.config.options.get("disable_hypothesis_tracking", False)
@@ -1023,6 +1028,15 @@ class WMBOOptimizer:
             "regime_posteriors": dict(descriptor.regime_posteriors),
             "selected_candidate_evidence": decision.metadata.get("selected_candidate_evidence"),
             "landscape_descriptor": descriptor.to_dict(),
+            "landscape_descriptor_unablated": (
+                descriptor_unablated.to_dict()
+                if self._agent.config.landscape_ablation
+                else None
+            ),
+            "ablation": {
+                "landscape_groups": list(self._agent.config.landscape_ablation),
+                "routing": self._agent.config.routing_ablation,
+            },
             "strategy_decision_context": strategy_context.to_dict(),
             "budget_phase": phase,
             "remaining_budget": self._control.remaining_budget(state.step, self.config.budget),

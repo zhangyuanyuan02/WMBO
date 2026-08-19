@@ -300,6 +300,108 @@ def _with_probabilistic_world_model(descriptor: LandscapeDescriptor) -> Landscap
     return LandscapeDescriptor(**{**enriched.__dict__, "labels": label_descriptor(enriched)})
 
 
+def apply_landscape_ablation(
+    descriptor: LandscapeDescriptor,
+    groups: Sequence[str] | None,
+) -> LandscapeDescriptor:
+    """Return a routing/world-model view with selected landscape evidence neutralised.
+
+    The underlying surrogate and optimiser implementations are left unchanged.  This
+    function only removes information available to the world-model/policy layer, which
+    makes the resulting benchmark suitable for controlled ablation studies.
+
+    Supported groups are ``smoothness``, ``modality``, ``curvature``, ``geometry``,
+    ``identifiability``, and ``all``.  Missing structural quantities are represented as
+    unknown/neutral evidence and the probabilistic world model is recomputed rather than
+    encoding a misleading numeric zero.
+    """
+
+    selected = {str(group).strip().lower() for group in (groups or ()) if str(group).strip()}
+    if not selected:
+        return descriptor
+    supported = {"smoothness", "modality", "curvature", "geometry", "identifiability", "all"}
+    unknown = sorted(selected - supported)
+    if unknown:
+        raise ValueError("Unsupported landscape ablation group(s): " + ", ".join(unknown))
+    if "all" in selected:
+        selected = {"smoothness", "modality", "curvature", "geometry", "identifiability"}
+
+    values = dict(descriptor.__dict__)
+    if "smoothness" in selected:
+        values["smoothness"] = None
+    if "modality" in selected:
+        values["modality"] = None
+    if "curvature" in selected:
+        values["curvature"] = None
+        values["valley_score"] = None
+    if "geometry" in selected:
+        values.update(
+            {
+                "anisotropy": None,
+                "dimension_sensitivity": tuple(),
+                "sensitive_dims": tuple(),
+                "lengthscale_condition": None,
+                "local_condition": None,
+                "rotation_score": None,
+                "effective_dimension": None,
+                "valley_score": None,
+                "geometry_reliability": 0.0,
+                "lengthscale_reliability": 0.0,
+            }
+        )
+    if "identifiability" in selected:
+        # Neutral epistemic evidence.  0.5 is deliberately used instead of zero:
+        # zero would falsely assert certainty / complete lack of coverage.
+        values["uncertainty"] = 0.5
+        values["coverage"] = 0.5
+
+    base = LandscapeDescriptor(
+        **{
+            **values,
+            "property_posteriors": {},
+            "credible_intervals": {},
+            "calibration": {},
+            "regime_posteriors": {},
+            "labels": {},
+        }
+    )
+    posteriors, intervals, calibration = estimate_property_posteriors(base)
+    if "identifiability" in selected:
+        calibration = {
+            **calibration,
+            "posterior_confidence": 0.5,
+            "world_model_entropy": 0.5,
+        }
+    regimes = regime_posteriors(
+        num_observations=base.num_observations,
+        dim=base.dim,
+        smoothness=base.smoothness,
+        modality=base.modality,
+        curvature=base.curvature,
+        uncertainty=base.uncertainty,
+        coverage=base.coverage,
+        world_model_entropy=calibration.get("world_model_entropy", 1.0),
+        geometry={
+            "lengthscale_condition": base.lengthscale_condition,
+            "local_condition": base.local_condition,
+            "rotation_score": base.rotation_score,
+            "effective_dimension": base.effective_dimension,
+            "geometry_reliability": base.geometry_reliability,
+            "lengthscale_reliability": base.lengthscale_reliability,
+        },
+    )
+    enriched = LandscapeDescriptor(
+        **{
+            **base.__dict__,
+            "property_posteriors": posteriors,
+            "credible_intervals": intervals,
+            "calibration": calibration,
+            "regime_posteriors": regimes,
+        }
+    )
+    return LandscapeDescriptor(**{**enriched.__dict__, "labels": label_descriptor(enriched)})
+
+
 def _categorical_posterior(
     *,
     score: float,
@@ -813,6 +915,7 @@ def _as_observation_arrays(observed_x: Matrix, observed_y: Sequence[float]) -> t
 
 __all__ = [
     "LandscapeDescriptor",
+    "apply_landscape_ablation",
     "describe_landscape",
     "estimate_property_posteriors",
     "estimate_smoothness",

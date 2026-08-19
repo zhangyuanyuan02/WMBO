@@ -1,0 +1,78 @@
+experiment:
+  seeds:
+  - 0
+  - 1
+  - 2
+  budget: 100
+  budget_per_dimension: 20
+  initial_samples: 10
+  initial_samples_per_dimension: 2
+  shared_initial_design: sobol
+  candidate_pool_size: 2048
+  methods:
+  - v51_ablate_modality
+  output_dir: results/paper_ablations/v51_ablate_modality
+benchmark_suite:
+  bbob:
+    functions:
+    - 1
+    - 5
+    - 7
+    - 8
+    - 9
+    - 10
+    - 11
+    - 12
+    - 13
+    - 14
+    - 15
+    - 16
+    - 19
+    - 20
+    - 22
+    - 24
+    dimensions:
+    - 5
+    - 10
+    instances:
+    - 1
+optimizer:
+  options:
+    surrogate: gaussian_process
+    noise_level: 1.0e-06
+    rule_policy:
+      mode: portfolio_v5
+      landscape_weight: 0.25
+      geometry_weight: 0.3
+      candidate_weight: 0.3
+      history_weight: 0.15
+      temperature: 0.2
+  method_options:
+    v51_ablate_modality:
+      base_method: wmbo_rule
+      rule_policy:
+        mode: portfolio_v5
+        landscape_weight: 0.25
+        geometry_weight: 0.3
+        candidate_weight: 0.3
+        history_weight: 0.15
+        temperature: 0.2
+        landscape_ablation:
+        - modality
+  wmbo_control:
+    candidate_options_per_strategy: 3
+    hypothesis_alignment_weight: 0.15
+    information_gain_weight: 0.35
+    gp_verifier_enabled: true
+    gp_verifier_min_score_ratio: 0.75
+    gp_verifier_duplicate_distance: 0.0001
+execution:
+  continue_on_error: true
+  resume: true
+  workers: 8
+reporting:
+  bootstrap_samples: 10000
+  confidence_level: 0.95
+  regret_floor: 1.0e-12
+logging:
+  verbose: true

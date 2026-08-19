@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from wmbo.agents import AgentState, WorldModelAgent
+from wmbo.agents import AgentState, RulePolicyConfig, WorldModelAgent
 from wmbo.control import PortfolioWMBOState, WMBOControlConfig
 from wmbo.llm_api import LLMAPIError, parse_reasoning_decision
 from wmbo.optimizers import _build_portfolio_candidate_options
@@ -23,6 +23,7 @@ from wmbo.portfolio import (
     regime_posteriors,
 )
 from wmbo.runner import BenchmarkRunRequest, run_single_benchmark
+from wmbo.descriptors import apply_landscape_ablation, describe_landscape
 
 
 def _posteriors(**updates: float) -> dict[str, float]:
@@ -84,6 +85,92 @@ def _agent_state(
             "strategy_trust": {name: 0.5 for name in PORTFOLIO_STRATEGIES},
         },
     )
+
+
+def test_paper_ablation_config_parses_landscape_and_routing_modes() -> None:
+    config = RulePolicyConfig.from_mapping(
+        {
+            "mode": "portfolio_v5",
+            "landscape_ablation": ["smoothness", "geometry"],
+            "routing_ablation": "context_only",
+        }
+    )
+    assert config.landscape_ablation == ("smoothness", "geometry")
+    assert config.routing_ablation == "context_only"
+
+
+def test_landscape_group_ablation_uses_unknown_or_neutral_evidence() -> None:
+    x = np.asarray(
+        [[0.1, 0.2], [0.2, 0.8], [0.5, 0.4], [0.8, 0.7], [0.9, 0.1]]
+    )
+    y = np.asarray([2.5, 1.9, 1.2, 0.7, 1.5])
+    descriptor = describe_landscape(
+        x.tolist(),
+        y.tolist(),
+        surrogate_metadata={"mean_std": 0.3, "lengthscales": [0.2, 1.5]},
+    )
+    ablated = apply_landscape_ablation(
+        descriptor,
+        ["smoothness", "geometry", "identifiability"],
+    )
+    assert ablated.smoothness is None
+    assert ablated.rotation_score is None
+    assert ablated.local_condition is None
+    assert ablated.uncertainty == pytest.approx(0.5)
+    assert ablated.coverage == pytest.approx(0.5)
+    assert ablated.calibration["world_model_entropy"] == pytest.approx(0.5)
+    assert ablated.property_posteriors["smoothness"] == {"unknown": 1.0}
+    assert sum(ablated.regime_posteriors.values()) == pytest.approx(1.0)
+
+
+def test_context_only_routing_neutralises_history_and_rc3_penalties() -> None:
+    state = _agent_state(allowed=["gp_ei", "cma_local"])
+    state = AgentState(
+        **{
+            **state.__dict__,
+            "decision_context": {
+                **dict(state.decision_context),
+                "strategy_trust": {
+                    "global_sobol": 0.5,
+                    "gp_ucb": 0.5,
+                    "gp_ei": 0.05,
+                    "anisotropic_turbo": 0.5,
+                    "cma_local": 0.95,
+                },
+                "strategy_routing_penalties": {"gp_ei": 0.65, "cma_local": 0.65},
+            },
+        }
+    )
+    decision = WorldModelAgent(
+        {"mode": "portfolio_v5", "routing_ablation": "context_only"}
+    ).decide(state)
+    components = decision.metadata["score_components"]
+    assert components["gp_ei"]["history"] == pytest.approx(0.5)
+    assert components["cma_local"]["history"] == pytest.approx(0.5)
+    assert decision.metadata["strategy_score_penalties"]["gp_ei"] == pytest.approx(1.0)
+    assert decision.metadata["strategy_score_penalties"]["cma_local"] == pytest.approx(1.0)
+
+
+def test_static_balanced_router_selects_least_used_eligible_local_strategy() -> None:
+    state = _agent_state(allowed=["gp_ei", "anisotropic_turbo", "cma_local"])
+    state = AgentState(
+        **{
+            **state.__dict__,
+            "decision_context": {
+                **dict(state.decision_context),
+                "strategy_evaluation_counts": {
+                    "gp_ei": 10,
+                    "anisotropic_turbo": 3,
+                    "cma_local": 7,
+                },
+            },
+        }
+    )
+    decision = WorldModelAgent(
+        {"mode": "portfolio_v5", "routing_ablation": "static_balanced"}
+    ).decide(state)
+    assert decision.strategy == "anisotropic_turbo"
+    assert decision.metadata["routing_ablation"] == "static_balanced"
 
 
 def test_regime_posteriors_are_normalised_and_geometry_sensitive() -> None:

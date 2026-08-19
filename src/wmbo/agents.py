@@ -17,6 +17,35 @@ from .portfolio import (
 
 Vector = Sequence[float]
 Matrix = Sequence[Vector]
+_LANDSCAPE_ABLATION_GROUPS = {
+    "smoothness",
+    "modality",
+    "curvature",
+    "geometry",
+    "identifiability",
+    "all",
+}
+
+
+def _normalise_landscape_ablation(value: object) -> tuple[str, ...]:
+    """Return validated landscape-ablation group names from YAML-friendly input."""
+
+    if value is None or value == "":
+        return tuple()
+    if isinstance(value, str):
+        raw_items = [item.strip().lower() for item in value.split(",") if item.strip()]
+    elif isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        raw_items = [str(item).strip().lower() for item in value if str(item).strip()]
+    else:
+        raise ValueError("rule_policy.landscape_ablation must be a string or list.")
+    unknown = sorted(set(raw_items) - _LANDSCAPE_ABLATION_GROUPS)
+    if unknown:
+        raise ValueError(
+            "unsupported landscape ablation group(s): " + ", ".join(unknown)
+        )
+    if "all" in raw_items:
+        return ("all",)
+    return tuple(dict.fromkeys(raw_items))
 _FINAL_REGRET_PHASE_PRIORS: dict[str, dict[str, float]] = {
     "early": {
         "global_diverse": -0.03,
@@ -71,11 +100,17 @@ class RulePolicyConfig:
     candidate_weight: float = 0.35
     history_weight: float = 0.20
     temperature: float = 0.20
+    landscape_ablation: tuple[str, ...] = field(default_factory=tuple)
+    routing_ablation: str = "adaptive"
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object] | None) -> RulePolicyConfig:
         raw = dict(value or {})
         mode = str(raw.get("mode", cls.mode)).strip().lower()
+        landscape_ablation = _normalise_landscape_ablation(
+            raw.get("landscape_ablation", ())
+        )
+        routing_ablation = str(raw.get("routing_ablation", "adaptive")).strip().lower()
         defaults = (
             {
                 "landscape_weight": 0.25,
@@ -98,6 +133,8 @@ class RulePolicyConfig:
             candidate_weight=float(raw.get("candidate_weight", defaults["candidate_weight"])),
             history_weight=float(raw.get("history_weight", defaults["history_weight"])),
             temperature=float(raw.get("temperature", cls.temperature)),
+            landscape_ablation=landscape_ablation,
+            routing_ablation=routing_ablation,
         )
         if config.mode not in {
             "legacy_v1", "continuous_v2", "continuous_v3", "continuous_v4", "portfolio_v5"
@@ -115,6 +152,11 @@ class RulePolicyConfig:
             raise ValueError("at least one rule policy weight must be positive.")
         if not math.isfinite(config.temperature) or config.temperature <= 0.0:
             raise ValueError("rule_policy.temperature must be positive.")
+        if config.routing_ablation not in {"adaptive", "context_only", "static_balanced"}:
+            raise ValueError(
+                "rule_policy.routing_ablation must be one of "
+                "adaptive, context_only, static_balanced."
+            )
         return config
 
 
@@ -450,10 +492,13 @@ class WorldModelAgent:
             state.candidate_options
         )
         trusts = dict(context.get("strategy_trust", {}) or {})
-        history_scores = {
-            strategy: _bounded(trusts.get(strategy), 0.5)
-            for strategy in PORTFOLIO_STRATEGIES
-        }
+        if self.config.routing_ablation == "context_only":
+            history_scores = {strategy: 0.5 for strategy in PORTFOLIO_STRATEGIES}
+        else:
+            history_scores = {
+                strategy: _bounded(trusts.get(strategy), 0.5)
+                for strategy in PORTFOLIO_STRATEGIES
+            }
         phase = str(context.get("budget_phase") or _phase_from_progress(progress))
         phase_multipliers = V51_ROUTING_WEIGHT_MULTIPLIERS.get(
             phase, V51_ROUTING_WEIGHT_MULTIPLIERS["middle"]
@@ -479,7 +524,13 @@ class WorldModelAgent:
         }
         configured_penalties = dict(context.get("strategy_routing_penalties", {}) or {})
         score_penalties = {
-            strategy: float(np.clip(float(configured_penalties.get(strategy, 1.0)), 0.0, 1.0))
+            strategy: (
+                1.0
+                if self.config.routing_ablation == "context_only"
+                else float(
+                    np.clip(float(configured_penalties.get(strategy, 1.0)), 0.0, 1.0)
+                )
+            )
             for strategy in PORTFOLIO_STRATEGIES
         }
         raw_scores = {
@@ -503,10 +554,32 @@ class WorldModelAgent:
         forced = str(context.get("forced_strategy") or "")
         if forced not in allowed:
             forced = ""
-        strategy = forced or max(
-            (item for item in PORTFOLIO_STRATEGIES if item in allowed),
-            key=lambda item: raw_scores[item],
-        )
+        if forced:
+            strategy = forced
+        elif self.config.routing_ablation == "static_balanced":
+            counts = {
+                str(name): int(value)
+                for name, value in dict(
+                    context.get("strategy_evaluation_counts", {}) or {}
+                ).items()
+            }
+            local_allowed = [
+                item
+                for item in ("gp_ei", "anisotropic_turbo", "cma_local")
+                if item in allowed
+            ]
+            selectable = local_allowed or [
+                item for item in PORTFOLIO_STRATEGIES if item in allowed
+            ]
+            strategy = min(
+                selectable,
+                key=lambda item: (counts.get(item, 0), PORTFOLIO_STRATEGIES.index(item)),
+            )
+        else:
+            strategy = max(
+                (item for item in PORTFOLIO_STRATEGIES if item in allowed),
+                key=lambda item: raw_scores[item],
+            )
         selected = best_options.get(strategy)
         selected_candidate_id = (
             str(selected.get("candidate_id"))
@@ -602,6 +675,8 @@ class WorldModelAgent:
                 "rule_policy_mode": self.config.mode,
                 "rule_policy_version": PORTFOLIO_POLICY_VERSION,
                 "budget_phase": phase,
+                "landscape_ablation": list(self.config.landscape_ablation),
+                "routing_ablation": self.config.routing_ablation,
             },
         )
     def _decide_continuous(self, state: AgentState) -> ReasoningDecision:
